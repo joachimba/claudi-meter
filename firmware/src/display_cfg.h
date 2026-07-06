@@ -1,14 +1,15 @@
 #pragma once
 
+// ---- Display resolution (always defined; UI code uses these in stubs too) ----
+#define LCD_WIDTH   480
+#define LCD_HEIGHT  480
+
+#ifndef CLAWDMETER_SIM_BUILD
 #include <Arduino_GFX_Library.h>
 #include <TouchDrvCSTXXX.hpp>
 #include <XPowersLib.h>
 #include <SensorQMI8658.hpp>
 #include <Wire.h>
-
-// ---- Display resolution ----
-#define LCD_WIDTH   480
-#define LCD_HEIGHT  480
 
 // ---- QSPI display pins (CO5300) ----
 #define LCD_CS      12
@@ -35,3 +36,4 @@ extern Arduino_CO5300 *gfx;
 extern TouchDrvCST92xx touch;
 extern XPowersPMU pmu;
 extern SensorQMI8658 imu;
+#endif  // CLAWDMETER_SIM_BUILD

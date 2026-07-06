@@ -8,6 +8,9 @@
 #include "power.h"
 #include "imu.h"
 #include "splash.h"
+#include "settings.h"
+#include "pomodoro.h"
+#include "oled_protect.h"
 #include "usage_rate.h"
 
 // Physical buttons (global, screen-independent):
@@ -28,6 +31,10 @@ XPowersPMU pmu;
 SensorQMI8658 imu;
 
 static UsageData usage = {};
+static SpotifyData spotify = {};
+static CalendarData calendar = {};
+static PhotoData photo = {};
+static BTAccessoriesData bt_acc = {};
 
 // ---- Touch interrupt + shared state ----
 static volatile bool     touch_pressed = false;
@@ -154,8 +161,11 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 }
 
-// Parse a JSON line into UsageData
-static bool parse_json(const char* json, UsageData* out) {
+// Parse a JSON line into UsageData / SpotifyData / CalendarData.
+// Daemon sends one merged payload; missing sections leave their valid flag
+// unchanged so a partial update doesn't blank existing UI state.
+static bool parse_json(const char* json, UsageData* u, SpotifyData* sp,
+                       CalendarData* cal, PhotoData* pho, BTAccessoriesData* bta) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
@@ -163,13 +173,63 @@ static bool parse_json(const char* json, UsageData* out) {
         return false;
     }
 
-    out->session_pct = doc["s"] | 0.0f;
-    out->session_reset_mins = doc["sr"] | -1;
-    out->weekly_pct = doc["w"] | 0.0f;
-    out->weekly_reset_mins = doc["wr"] | -1;
-    strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
-    out->ok = doc["ok"] | false;
-    out->valid = true;
+    if (doc["s"].is<float>() || doc["s"].is<int>()) {
+        u->session_pct = doc["s"] | 0.0f;
+        u->session_reset_mins = doc["sr"] | -1;
+        u->weekly_pct = doc["w"] | 0.0f;
+        u->weekly_reset_mins = doc["wr"] | -1;
+        strlcpy(u->status, doc["st"] | "unknown", sizeof(u->status));
+        u->ok = doc["ok"] | false;
+        u->valid = true;
+    }
+
+    if (doc["spt"].is<const char*>() || doc["spa"].is<const char*>() || doc["spp"].is<bool>()) {
+        strlcpy(sp->track, doc["spt"] | "", sizeof(sp->track));
+        strlcpy(sp->artist, doc["spa"] | "", sizeof(sp->artist));
+        sp->playing = doc["spp"] | false;
+        sp->valid = true;
+    }
+
+    if (doc["spc"].is<int>() || doc["spc"].is<unsigned int>() || doc["spc"].is<long>() ||
+        doc["spc"].is<unsigned long>()) {
+        sp->bg_color = (uint32_t)(doc["spc"].as<long>());
+        sp->has_color = true;
+        sp->valid = true;
+    }
+
+    if (doc["cat"].is<const char*>() || doc["cam"].is<int>()) {
+        strlcpy(cal->title, doc["cat"] | "", sizeof(cal->title));
+        cal->mins_until = doc["cam"] | -1;
+        cal->valid = true;
+    }
+
+    if (doc["pht"].is<const char*>()) {
+        strlcpy(pho->caption, doc["pht"] | "", sizeof(pho->caption));
+        pho->valid = true;
+    }
+
+    if (doc["afk"].is<bool>()) {
+        ui_set_afk(doc["afk"].as<bool>());
+    }
+
+    if (doc["attn"].is<bool>()) {
+        ui_set_attention(doc["attn"].as<bool>());
+    }
+
+    if (doc["bta"].is<JsonArrayConst>()) {
+        JsonArrayConst arr = doc["bta"].as<JsonArrayConst>();
+        bta->count = 0;
+        for (JsonVariantConst v : arr) {
+            if (bta->count >= BT_ACC_MAX) break;
+            BTAccessory& dst = bta->items[bta->count];
+            strlcpy(dst.name, v["n"] | "", sizeof(dst.name));
+            dst.battery_pct = v["b"] | -1;
+            dst.charging    = v["c"] | false;
+            bta->count++;
+        }
+        bta->valid = true;
+    }
+
     return true;
 }
 
@@ -278,6 +338,11 @@ void setup() {
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touch_cb);
 
+    // Init settings (NVS-backed) before UI so initial widget state matches
+    settings_init();
+    pomodoro_init();
+    oled_protect_init();
+
     // Init BLE data channel
     ble_init();
 
@@ -338,6 +403,8 @@ void loop() {
     power_tick();
     imu_tick();
     splash_tick();
+    pomodoro_tick();
+    oled_protect_tick();
 
     // Three-button input (global, screen-independent):
     //   LEFT  (GPIO 0)  → Space (voice-mode push-to-talk; press & release tracked)
@@ -352,16 +419,41 @@ void loop() {
             if (back_now) ble_keyboard_press(0x2C, 0);  // HID Space, no mods
             else          ble_keyboard_release();
             back_was = back_now;
+            oled_protect_note_activity();
         }
         if (fwd_now != fwd_was) {
             if (fwd_now) ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
             else         ble_keyboard_release();
             fwd_was = fwd_now;
+            oled_protect_note_activity();
         }
 
         if (power_pwr_pressed()) {
             if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
             else                                          ui_cycle_screen();
+            oled_protect_note_activity();
+        }
+        if (touch_pressed) oled_protect_note_activity();
+    }
+
+    // Auto-rotate screens (skips Bluetooth + Splash). When the user enables
+    // this in Settings the dashboard cycles Usage → Spotify → Calendar →
+    // Settings → Usage at the configured interval.
+    {
+        static uint32_t last_rotate_ms = 0;
+        if (settings_auto_rotate()) {
+            uint32_t now = millis();
+            uint32_t interval = (uint32_t)settings_rotate_interval_sec() * 1000UL;
+            if (last_rotate_ms == 0) last_rotate_ms = now;
+            screen_t cs = ui_get_current_screen();
+            if (cs != SCREEN_SPLASH && cs != SCREEN_BLUETOOTH &&
+                cs != SCREEN_SETTINGS &&
+                now - last_rotate_ms >= interval) {
+                ui_cycle_screen_auto();
+                last_rotate_ms = now;
+            }
+        } else {
+            last_rotate_ms = 0;
         }
     }
 
@@ -388,9 +480,22 @@ void loop() {
     // Check for serial commands (screenshot, etc.)
     check_serial_cmd();
 
+    // Firmware-side stale-data watchdog: when the host laptop sleeps the
+    // daemon is suspended too, so it can't push an `afk:true` flag itself.
+    // If we haven't seen any JSON for a while, flip the AFK overlay on
+    // locally; clears the next time data arrives.
+    static uint32_t last_json_ms = 0;
+    {
+        const uint32_t STALE_MS = 120UL * 1000UL;
+        if (last_json_ms != 0 && (millis() - last_json_ms) > STALE_MS) {
+            ui_set_afk(true);
+        }
+    }
+
     // Process incoming BLE data
     if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
+        oled_protect_note_activity();
+        if (parse_json(ble_get_data(), &usage, &spotify, &calendar, &photo, &bt_acc)) {
             int g_before = usage_rate_group();
             usage_rate_sample(usage.session_pct);
             int g_after = usage_rate_group();
@@ -399,10 +504,43 @@ void loop() {
                     g_before, g_after, usage.session_pct);
                 if (splash_is_active()) splash_pick_for_current_rate();
             }
+            last_json_ms = millis();
+            // Daemon is alive again — assume not-AFK unless the daemon
+            // explicitly told us otherwise via the `afk` JSON key (handled
+            // inside parse_json).
+            ui_set_afk(false);
             ui_update(&usage);
+            ui_update_spotify(&spotify);
+            ui_update_calendar(&calendar);
+            ui_update_photo_caption(&photo);
+            ui_update_bt_accessories(&bt_acc);
             ble_send_ack();
         } else {
             ble_send_nack();
+        }
+    }
+
+    // Album art arrives in chunks on a separate GATT char; render when complete
+    if (ble_image_ready()) {
+        ui_update_spotify_art(ble_image_data(), BLE_ART_W, BLE_ART_H);
+        ble_image_consume();
+    }
+
+    // Ambient photo (full screen) reassembled on its own GATT char.
+    if (ble_photo_ready()) {
+        ui_update_photo_image(ble_photo_data());
+        ble_photo_consume();
+    }
+
+    // Hide the canvas while a new photo is mid-transfer so the user doesn't
+    // see half-old / half-new pixels rendered together.
+    {
+        static bool last_xfer = false;
+        bool xfer = ble_photo_transferring();
+        if (xfer != last_xfer) {
+            last_xfer = xfer;
+            extern void ui_set_photo_loading(bool);
+            ui_set_photo_loading(xfer);
         }
     }
 

@@ -4224,7 +4224,6 @@ const lv_font_t font_tiempos_34 = {
     .base_line = 7,
     .subpx = LV_FONT_SUBPX_NONE,
     .kerning = 0,
-    .static_bitmap = 0,
     .underline_position = -3,
     .underline_thickness = 1,
     .dsc = &font_dsc,

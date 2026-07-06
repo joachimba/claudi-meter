@@ -2815,7 +2815,6 @@ const lv_font_t font_styrene_28 = {
     .subpx = LV_FONT_SUBPX_NONE,
     .release_glyph = NULL,
     .kerning = 0,
-    .static_bitmap = 0,
     .underline_position = -1,
     .underline_thickness = 2,
     .dsc = &font_dsc,          /*The custom font data. Will be accessed by `get_glyph_bitmap/dsc` */

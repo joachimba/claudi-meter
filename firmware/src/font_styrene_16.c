@@ -1837,7 +1837,6 @@ const lv_font_t font_styrene_16 = {
     .base_line = 4,
     .subpx = LV_FONT_SUBPX_NONE,
     .kerning = 0,
-    .static_bitmap = 0,
     .underline_position = -1,
     .underline_thickness = 1,
     .dsc = &font_dsc,

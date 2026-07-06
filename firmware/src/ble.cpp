@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
+#include <esp_heap_caps.h>
 
 #define DEVICE_NAME "Claude Controller"
 
@@ -10,8 +11,27 @@
 #define RX_CHAR_UUID        "4c41555a-4465-7669-6365-000000000002"  // host writes here
 #define TX_CHAR_UUID        "4c41555a-4465-7669-6365-000000000003"  // device ack/nack notifies
 #define REQ_CHAR_UUID       "4c41555a-4465-7669-6365-000000000004"  // device-initiated refresh request
+#define IMG_CHAR_UUID       "4c41555a-4465-7669-6365-000000000005"  // album art chunks
+#define CMD_CHAR_UUID       "4c41555a-4465-7669-6365-000000000006"  // device-initiated commands (1-byte notify)
+#define PHOTO_CHAR_UUID     "4c41555a-4465-7669-6365-000000000007"  // ambient photo chunks
 
 #define BLE_BUF_SIZE 512
+#define BLE_IMG_BYTES   (BLE_ART_W   * BLE_ART_H   * 2)
+#define BLE_PHOTO_BYTES (BLE_PHOTO_W * BLE_PHOTO_H * 2)
+
+// IMG frame header: 6 bytes LE
+//   [0..1] track_hash    — daemon-chosen ID per track URL
+//   [2..3] byte_offset   — destination offset in the image buffer
+//   [4..5] total_bytes   — full image byte count (= BLE_IMG_BYTES)
+// followed by variable-length RGB565 payload bytes (raster order, lo-byte first).
+#define IMG_HDR_SIZE 6
+
+// PHOTO frame header: 10 bytes LE — wider offset/total so the 460 KB
+// full-screen frame fits.
+//   [0..1] photo_hash
+//   [2..5] byte_offset   (uint32_t)
+//   [6..9] total_bytes   (uint32_t, = BLE_PHOTO_BYTES)
+#define PHOTO_HDR_SIZE 10
 
 // HID keyboard report descriptor (standard 6-KRO boot-protocol-compatible).
 // Includes the LED output report (Num/Caps/Scroll Lock indicators) — without
@@ -60,6 +80,9 @@ static NimBLECharacteristic* input_kbd = nullptr;
 static NimBLECharacteristic* tx_char = nullptr;
 static NimBLECharacteristic* rx_char = nullptr;
 static NimBLECharacteristic* req_char = nullptr;
+static NimBLECharacteristic* img_char = nullptr;
+static NimBLECharacteristic* cmd_char = nullptr;
+static NimBLECharacteristic* photo_char = nullptr;
 
 static ble_state_t state = BLE_STATE_INIT;
 static bool need_advertise = false;
@@ -67,6 +90,26 @@ static char rx_buf[BLE_BUF_SIZE];
 static volatile bool data_ready = false;
 static volatile bool has_received_data = false;
 static char mac_str[18];
+
+// Image reassembly state.
+// Daemon writes IMG frames as [hash:2 LE][offset:2 LE][total:2 LE][payload...].
+// Hash is a 16-bit ID for the current track URL (anti-collision: we drop the
+// in-flight buffer when the daemon switches to a new hash). The receive
+// counter advances by payload length per chunk; once it reaches total we
+// flip ready. Writes are sent response=true so order + delivery are
+// guaranteed by the host stack.
+static uint8_t*  img_buf = nullptr;
+static uint16_t  img_active_hash = 0;
+static uint16_t  img_expected_total = 0;
+static uint32_t  img_received_bytes = 0;
+static volatile bool img_ready = false;
+
+// Same reassembly machinery as IMG but at PHOTO scale.
+static uint8_t*  photo_buf = nullptr;
+static uint16_t  photo_active_hash = 0;
+static uint32_t  photo_expected_total = 0;
+static uint32_t  photo_received_bytes = 0;
+static volatile bool photo_ready = false;
 
 static void start_advertising() {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -86,6 +129,7 @@ static void start_advertising() {
     scanResp.setCompleteServices(NimBLEUUID(SERVICE_UUID));
     adv->setScanResponseData(scanResp);
     adv->enableScanResponse(true);
+
     bool ok = adv->start();
     // Only reflect ADVERTISING in the UI state when no client is connected.
     // With MAX_CONNECTIONS=2, onConnect re-advertises to fill the second slot;
@@ -147,9 +191,82 @@ class ReqCallbacks : public NimBLECharacteristicCallbacks {
     }
 };
 
+class PhotoCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& info) override {
+        if (!photo_buf) return;
+        std::string val = chr->getValue();
+        const uint8_t* p = (const uint8_t*)val.data();
+        size_t len = val.length();
+        if (len < PHOTO_HDR_SIZE) return;
+
+        uint16_t hash =
+            (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+        uint32_t offset =
+            (uint32_t)p[2] | ((uint32_t)p[3] << 8) |
+            ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 24);
+        uint32_t total =
+            (uint32_t)p[6] | ((uint32_t)p[7] << 8) |
+            ((uint32_t)p[8] << 16) | ((uint32_t)p[9] << 24);
+        size_t payload_len = len - PHOTO_HDR_SIZE;
+
+        if (total != BLE_PHOTO_BYTES) return;
+        if (offset + payload_len > BLE_PHOTO_BYTES) return;
+
+        if (hash != photo_active_hash || offset == 0) {
+            photo_active_hash = hash;
+            photo_expected_total = total;
+            photo_received_bytes = 0;
+            photo_ready = false;
+        }
+        memcpy(photo_buf + offset, p + PHOTO_HDR_SIZE, payload_len);
+        photo_received_bytes += payload_len;
+        if (photo_received_bytes >= photo_expected_total) {
+            photo_ready = true;
+        }
+    }
+};
+
+class ImgCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& info) override {
+        if (!img_buf) return;  // PSRAM alloc failed at init
+        std::string val = chr->getValue();
+        const uint8_t* p = (const uint8_t*)val.data();
+        size_t len = val.length();
+        if (len < IMG_HDR_SIZE) return;
+
+        uint16_t hash   = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+        uint16_t offset = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
+        uint16_t total  = (uint16_t)p[4] | ((uint16_t)p[5] << 8);
+        size_t payload_len = len - IMG_HDR_SIZE;
+
+        if (total != BLE_IMG_BYTES) {
+            // Daemon and firmware disagree on art dimensions — ignore.
+            return;
+        }
+        if ((uint32_t)offset + payload_len > BLE_IMG_BYTES) return;
+
+        if (hash != img_active_hash || offset == 0) {
+            img_active_hash = hash;
+            img_expected_total = total;
+            img_received_bytes = 0;
+            img_ready = false;
+        }
+
+        memcpy(img_buf + offset, p + IMG_HDR_SIZE, payload_len);
+        img_received_bytes += payload_len;
+
+        if (img_received_bytes >= img_expected_total) {
+            img_ready = true;
+        }
+    }
+};
+
 void ble_init(void) {
     NimBLEDevice::init(DEVICE_NAME);
     NimBLEDevice::setSecurityAuth(true, false, true);  // bonding, no MITM, SC
+    // Bump preferred MTU so a single write fits the extended payload
+    // (usage + spotify + calendar can run to ~250 bytes of JSON).
+    NimBLEDevice::setMTU(247);
 
     // Format MAC address
     NimBLEAddress addr = NimBLEDevice::getAddress();
@@ -201,6 +318,39 @@ void ble_init(void) {
     );
     static ReqCallbacks reqCb;
     req_char->setCallbacks(&reqCb);
+
+    img_char = svc->createCharacteristic(
+        IMG_CHAR_UUID,
+        NIMBLE_PROPERTY::WRITE
+    );
+    static ImgCallbacks imgCb;
+    img_char->setCallbacks(&imgCb);
+
+    cmd_char = svc->createCharacteristic(
+        CMD_CHAR_UUID,
+        NIMBLE_PROPERTY::NOTIFY
+    );
+
+    img_buf = (uint8_t*)heap_caps_malloc(BLE_IMG_BYTES, MALLOC_CAP_SPIRAM);
+    if (!img_buf) {
+        Serial.println("BLE: img_buf PSRAM alloc failed");
+    } else {
+        memset(img_buf, 0, BLE_IMG_BYTES);
+    }
+
+    photo_char = svc->createCharacteristic(
+        PHOTO_CHAR_UUID,
+        NIMBLE_PROPERTY::WRITE
+    );
+    static PhotoCallbacks photoCb;
+    photo_char->setCallbacks(&photoCb);
+
+    photo_buf = (uint8_t*)heap_caps_malloc(BLE_PHOTO_BYTES, MALLOC_CAP_SPIRAM);
+    if (!photo_buf) {
+        Serial.println("BLE: photo_buf PSRAM alloc failed");
+    } else {
+        memset(photo_buf, 0, BLE_PHOTO_BYTES);
+    }
 
     svc->start();
     server->start();
@@ -260,6 +410,28 @@ void ble_send_nack(void) {
     }
 }
 
+bool ble_image_ready(void) {
+    return img_ready;
+}
+
+const uint8_t* ble_image_data(void) {
+    return img_buf;
+}
+
+void ble_image_consume(void) {
+    img_ready = false;
+}
+
+bool ble_photo_ready(void)            { return photo_ready; }
+bool ble_photo_transferring(void) {
+    // Chunks are arriving but the buffer isn't complete yet → don't render
+    // the canvas, or the user sees half-old / half-new pixels at once.
+    return photo_received_bytes > 0 &&
+           photo_received_bytes < photo_expected_total;
+}
+const uint8_t* ble_photo_data(void)   { return photo_buf; }
+void ble_photo_consume(void)          { photo_ready = false; }
+
 void ble_request_refresh(void) {
     if (state == BLE_STATE_CONNECTED && req_char) {
         uint8_t v = 0x01;
@@ -267,6 +439,13 @@ void ble_request_refresh(void) {
         req_char->notify();
         Serial.println("BLE: refresh requested");
     }
+}
+
+void ble_send_cmd(uint8_t code) {
+    if (state != BLE_STATE_CONNECTED || !cmd_char) return;
+    cmd_char->setValue(&code, 1);
+    cmd_char->notify();
+    Serial.printf("BLE: cmd 0x%02x\n", code);
 }
 
 void ble_keyboard_press(uint8_t key, uint8_t modifier) {
