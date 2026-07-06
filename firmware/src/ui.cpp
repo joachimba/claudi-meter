@@ -117,6 +117,18 @@ static lv_obj_t* btacc_container;
 static lv_obj_t* btacc_list_parent;
 static lv_obj_t* btacc_empty_label;
 
+// ---- Usage History (daily token graph) screen ----
+#define HG_W 440          // graph canvas width
+#define HG_H 236          // graph canvas height
+#define HG_PAD_TOP 16     // keep the peak off the top edge
+static lv_obj_t* history_container = nullptr;
+static lv_obj_t* lbl_hist_caption  = nullptr;   // "TOKENS / DAY"
+static lv_obj_t* lbl_hist_value    = nullptr;   // big headline (today)
+static lv_obj_t* lbl_hist_delta    = nullptr;   // vs yesterday
+static lv_obj_t* history_canvas    = nullptr;
+static uint16_t* history_buf       = nullptr;
+static HistoryData history_data    = {};        // last payload, kept for redraw
+
 // ---- AFK overlay (sits above every screen when the host reports idle) ----
 #define AFK_ANIM_GRID 20
 #define AFK_ANIM_CELL 8
@@ -361,6 +373,190 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_style_text_font(lbl_anim, &font_mono_32, 0);
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -15);
+}
+
+// ======== Usage History Screen — smooth daily token graph ========
+
+// Pack r,g,b into the RGB565 value LVGL stores in a canvas buffer.
+static inline uint16_t hg_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    return lv_color_to_u16(lv_color_make(r, g, b));
+}
+
+// Anthropic terra-cotta (THEME_ACCENT 0xd97757) as components, for scaling.
+#define HG_ACC_R 0xD9
+#define HG_ACC_G 0x77
+#define HG_ACC_B 0x57
+
+// Format a token count into a compact headline: 47.3M / 812k / 137.
+static void hg_format_tokens(uint32_t tok, char* buf, size_t n) {
+    if (tok >= 1000000000UL)      snprintf(buf, n, "%.1fB", tok / 1e9);
+    else if (tok >= 1000000UL)    snprintf(buf, n, "%.1fM", tok / 1e6);
+    else if (tok >= 1000UL)       snprintf(buf, n, "%.0fk", tok / 1e3);
+    else                          snprintf(buf, n, "%lu", (unsigned long)tok);
+}
+
+// Redraw the graph from history_data into history_buf.
+static void render_history_graph(void) {
+    if (!history_buf) return;
+    const int W = HG_W, H = HG_H;
+    // Clear to black.
+    for (int i = 0; i < W * H; i++) history_buf[i] = 0x0000;
+
+    int n = history_data.count;
+    if (!history_data.valid || n < 2) {
+        if (history_canvas) lv_obj_invalidate(history_canvas);
+        return;
+    }
+    if (n > HISTORY_MAX_DAYS) n = HISTORY_MAX_DAYS;
+
+    // Peak for vertical scaling (baseline is 0 tokens).
+    uint16_t vmax = 1;
+    for (int i = 0; i < n; i++) if (history_data.vals[i] > vmax) vmax = history_data.vals[i];
+
+    const int plotH = H - 1 - HG_PAD_TOP;
+    // Screen-Y for each data point (top of the curve).
+    static float yv[HISTORY_MAX_DAYS];
+    for (int i = 0; i < n; i++) {
+        float frac = (float)history_data.vals[i] / (float)vmax;   // 0..1
+        yv[i] = (float)(H - 1) - frac * (float)plotH;
+    }
+
+    // Faint dashed baseline gridlines (25/50/75%).
+    uint16_t grid = hg_rgb(40, 40, 38);
+    for (int g = 1; g <= 3; g++) {
+        int gy = (H - 1) - (plotH * g) / 4;
+        if (gy < 0 || gy >= H) continue;
+        for (int x = 0; x < W; x += 10)
+            for (int dx = 0; dx < 5 && x + dx < W; dx++)
+                history_buf[gy * W + x + dx] = grid;
+    }
+
+    // For each pixel column, evaluate the Catmull-Rom curve through the points.
+    static int colTop[HG_W];
+    for (int px = 0; px < W; px++) {
+        float f = (float)px / (float)(W - 1) * (float)(n - 1);
+        int i = (int)f;
+        if (i > n - 2) i = n - 2;
+        float t = f - i;
+        float y0 = yv[i > 0 ? i - 1 : 0];
+        float y1 = yv[i];
+        float y2 = yv[i + 1];
+        float y3 = yv[i < n - 2 ? i + 2 : n - 1];
+        float y = 0.5f * ((2.0f * y1) + (-y0 + y2) * t
+                          + (2.0f * y0 - 5.0f * y1 + 4.0f * y2 - y3) * t * t
+                          + (-y0 + 3.0f * y1 - 3.0f * y2 + y3) * t * t * t);
+        int iy = (int)(y + 0.5f);
+        if (iy < HG_PAD_TOP) iy = HG_PAD_TOP;
+        if (iy > H - 1) iy = H - 1;
+        colTop[px] = iy;
+
+        // Gradient area fill: vivid terra-cotta at the curve fading to black.
+        for (int yy = iy; yy < H; yy++) {
+            float depth = (H - 1 - iy) > 0 ? (float)(yy - iy) / (float)(H - 1 - iy) : 0.0f;
+            float t2 = 1.0f - depth;
+            float k = 0.06f + 0.80f * t2 * t2;   // ~0.86 near line -> 0.06 at floor
+            history_buf[yy * W + px] = hg_rgb((uint8_t)(HG_ACC_R * k),
+                                              (uint8_t)(HG_ACC_G * k),
+                                              (uint8_t)(HG_ACC_B * k));
+        }
+    }
+
+    // Stroke the curve line on top (3px, brightened terra-cotta so it pops).
+    uint16_t line = hg_rgb(0xFF, 0xA6, 0x88);
+    for (int px = 0; px < W; px++) {
+        for (int d = -2; d <= 0; d++) {
+            int yy = colTop[px] + d;
+            if (yy >= 0 && yy < H) history_buf[yy * W + px] = line;
+        }
+    }
+
+    // End dot at the most recent day (anchor the right edge). Inset a couple
+    // px so the full disc stays on-canvas.
+    int ex = W - 6, ey = colTop[W - 1];
+    uint16_t glow = hg_rgb(0xFF, 0xF2, 0xEC);   // near-white core
+    for (int dy = -8; dy <= 8; dy++)
+        for (int dx = -8; dx <= 8; dx++) {
+            int x = ex + dx, y = ey + dy;
+            if (x < 0 || x >= W || y < 0 || y >= H) continue;
+            int r2 = dx * dx + dy * dy;
+            if (r2 <= 49) history_buf[y * W + x] = (r2 <= 12) ? glow : line;
+        }
+
+    if (history_canvas) lv_obj_invalidate(history_canvas);
+}
+
+static void init_history_screen(lv_obj_t* scr) {
+    history_container = lv_obj_create(scr);
+    lv_obj_set_size(history_container, SCR_W, SCR_H);
+    lv_obj_set_pos(history_container, 0, 0);
+    lv_obj_set_style_bg_opa(history_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(history_container, 0, 0);
+    lv_obj_set_style_pad_all(history_container, 0, 0);
+    lv_obj_clear_flag(history_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(history_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    // Header block sits below the persistent top-left logo (y clears 100px).
+    lbl_hist_caption = lv_label_create(history_container);
+    lv_label_set_text(lbl_hist_caption, "TOKENS / DAY");
+    lv_obj_set_style_text_font(lbl_hist_caption, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_hist_caption, COL_DIM, 0);
+    lv_obj_set_style_text_letter_space(lbl_hist_caption, 3, 0);
+    lv_obj_set_pos(lbl_hist_caption, MARGIN, 104);
+
+    lbl_hist_value = lv_label_create(history_container);
+    lv_label_set_text(lbl_hist_value, "--");
+    lv_obj_set_style_text_font(lbl_hist_value, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(lbl_hist_value, COL_TEXT, 0);
+    lv_obj_set_pos(lbl_hist_value, MARGIN, 128);
+
+    lbl_hist_delta = lv_label_create(history_container);
+    lv_label_set_text(lbl_hist_delta, "");
+    lv_obj_set_style_text_font(lbl_hist_delta, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(lbl_hist_delta, COL_DIM, 0);
+    lv_obj_set_pos(lbl_hist_delta, MARGIN, 196);
+
+    // Full-width graph canvas along the bottom.
+    history_buf = (uint16_t*)heap_caps_malloc(HG_W * HG_H * 2, MALLOC_CAP_SPIRAM);
+    if (history_buf) {
+        memset(history_buf, 0, HG_W * HG_H * 2);
+        history_canvas = lv_canvas_create(history_container);
+        lv_canvas_set_buffer(history_canvas, history_buf, HG_W, HG_H,
+                             LV_COLOR_FORMAT_RGB565);
+        lv_obj_set_pos(history_canvas, MARGIN, SCR_H - HG_H);
+    }
+
+    lv_obj_add_flag(history_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+void ui_update_history(const HistoryData* data) {
+    if (!data || !data->valid || !lbl_hist_value) return;
+    history_data = *data;
+
+    int n = history_data.count;
+    if (n < 1) return;
+
+    uint32_t today = (uint32_t)history_data.vals[n - 1] * 100000UL;
+    char buf[24];
+    hg_format_tokens(today, buf, sizeof(buf));
+    lv_label_set_text(lbl_hist_value, buf);
+
+    if (n >= 2) {
+        long yest = (long)history_data.vals[n - 2] * 100000L;
+        long delta = (long)today - yest;
+        char db[48], tb[24];
+        hg_format_tokens((uint32_t)(delta < 0 ? -delta : delta), tb, sizeof(tb));
+        if (yest > 0) {
+            int pctv = (int)(delta * 100 / yest);
+            snprintf(db, sizeof(db), "%s%s (%d%%)", delta >= 0 ? "+" : "-", tb, pctv);
+        } else {
+            snprintf(db, sizeof(db), "%s%s", delta >= 0 ? "+" : "-", tb);
+        }
+        lv_label_set_text(lbl_hist_delta, db);
+        lv_obj_set_style_text_color(lbl_hist_delta,
+                                    delta >= 0 ? COL_GREEN : COL_RED, 0);
+    }
+
+    render_history_graph();
 }
 
 // ======== Bluetooth Screen (480x480) ========
@@ -1041,6 +1237,7 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
+    init_history_screen(scr);
     init_spotify_screen(scr);
     init_calendar_screen(scr);
     init_pomodoro_screen(scr);
@@ -1376,6 +1573,7 @@ static void ble_reset_click_cb(lv_event_t* e) {
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+    if (history_container) lv_obj_add_flag(history_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(spotify_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(calendar_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(pomodoro_container, LV_OBJ_FLAG_HIDDEN);
@@ -1388,6 +1586,7 @@ void ui_show_screen(screen_t screen) {
     switch (screen) {
     case SCREEN_SPLASH:     splash_show(); break;
     case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_HISTORY:    if (history_container) { lv_obj_clear_flag(history_container, LV_OBJ_FLAG_HIDDEN); render_history_graph(); } break;
     case SCREEN_SPOTIFY:    lv_obj_clear_flag(spotify_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_CALENDAR:   lv_obj_clear_flag(calendar_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_POMODORO:   lv_obj_clear_flag(pomodoro_container, LV_OBJ_FLAG_HIDDEN); ui_refresh_pomodoro(); break;
@@ -1415,7 +1614,8 @@ void ui_cycle_screen(void) {
     // content.
     screen_t next;
     switch (current_screen) {
-    case SCREEN_USAGE:     next = SCREEN_SPOTIFY;   break;
+    case SCREEN_USAGE:     next = SCREEN_HISTORY;   break;
+    case SCREEN_HISTORY:   next = SCREEN_SPOTIFY;   break;
     case SCREEN_SPOTIFY:   next = SCREEN_CALENDAR;  break;
     case SCREEN_CALENDAR:  next = SCREEN_POMODORO;  break;
     case SCREEN_POMODORO:  next = SCREEN_PHOTO;     break;
@@ -1432,7 +1632,8 @@ void ui_cycle_screen_auto(void) {
     // Auto-rotate stays on content screens only — Settings is config-only.
     screen_t next;
     switch (current_screen) {
-    case SCREEN_USAGE:     next = SCREEN_SPOTIFY;  break;
+    case SCREEN_USAGE:     next = SCREEN_HISTORY; break;
+    case SCREEN_HISTORY:   next = SCREEN_SPOTIFY; break;
     case SCREEN_SPOTIFY:   next = SCREEN_CALENDAR; break;
     case SCREEN_CALENDAR:  next = SCREEN_POMODORO; break;
     case SCREEN_POMODORO:  next = SCREEN_PHOTO;    break;

@@ -31,6 +31,14 @@ struct PhotoData {
     bool valid;
 };
 
+#define HISTORY_MAX_DAYS 30
+struct HistoryData {
+    // Daily token usage, oldest -> newest, in units of 100k tokens.
+    uint16_t vals[HISTORY_MAX_DAYS];
+    uint8_t  count;   // number of valid entries (<= HISTORY_MAX_DAYS)
+    bool     valid;
+};
+
 #define BT_ACC_MAX 6
 struct BTAccessory {
     char name[40];

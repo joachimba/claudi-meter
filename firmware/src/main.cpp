@@ -35,6 +35,7 @@ static SpotifyData spotify = {};
 static CalendarData calendar = {};
 static PhotoData photo = {};
 static BTAccessoriesData bt_acc = {};
+static HistoryData history = {};
 
 // ---- Touch interrupt + shared state ----
 static volatile bool     touch_pressed = false;
@@ -165,7 +166,8 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
 // Daemon sends one merged payload; missing sections leave their valid flag
 // unchanged so a partial update doesn't blank existing UI state.
 static bool parse_json(const char* json, UsageData* u, SpotifyData* sp,
-                       CalendarData* cal, PhotoData* pho, BTAccessoriesData* bta) {
+                       CalendarData* cal, PhotoData* pho, BTAccessoriesData* bta,
+                       HistoryData* hist) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
@@ -228,6 +230,16 @@ static bool parse_json(const char* json, UsageData* u, SpotifyData* sp,
             bta->count++;
         }
         bta->valid = true;
+    }
+
+    if (doc["tk"].is<JsonArrayConst>()) {
+        JsonArrayConst arr = doc["tk"].as<JsonArrayConst>();
+        hist->count = 0;
+        for (JsonVariantConst v : arr) {
+            if (hist->count >= HISTORY_MAX_DAYS) break;
+            hist->vals[hist->count++] = (uint16_t)(v.as<unsigned int>());
+        }
+        hist->valid = true;
     }
 
     return true;
@@ -495,7 +507,7 @@ void loop() {
     // Process incoming BLE data
     if (ble_has_data()) {
         oled_protect_note_activity();
-        if (parse_json(ble_get_data(), &usage, &spotify, &calendar, &photo, &bt_acc)) {
+        if (parse_json(ble_get_data(), &usage, &spotify, &calendar, &photo, &bt_acc, &history)) {
             int g_before = usage_rate_group();
             usage_rate_sample(usage.session_pct);
             int g_after = usage_rate_group();
@@ -514,6 +526,7 @@ void loop() {
             ui_update_calendar(&calendar);
             ui_update_photo_caption(&photo);
             ui_update_bt_accessories(&bt_acc);
+            ui_update_history(&history);
             ble_send_ack();
         } else {
             ble_send_nack();

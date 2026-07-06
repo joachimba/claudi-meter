@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 import zlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -82,6 +82,12 @@ SCAN_TIMEOUT = 8.0
 CONNECT_TIMEOUT = 20.0   # bound client.connect(); a half-open link must not hang forever
 BLE_WRITE_TIMEOUT = 10.0  # bound every GATT write; a stuck write -> teardown + reconnect
 WATCHDOG_STALL_S = 45.0   # no main-loop progress this long -> force disconnect (unwedge)
+
+# --- Daily token-usage history (for the firmware graph screen) ---
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+HISTORY_DAYS = 30          # days of history shown on the graph
+HISTORY_INTERVAL_S = 300   # recompute + push the token history at most this often
+TOKEN_UNIT = 100_000       # graph values sent in units of 100k tokens (fits uint16)
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
@@ -684,6 +690,64 @@ async def scan_for_device() -> str | None:
     return None
 
 
+def _parse_file_daily(fp: Path) -> dict[str, int]:
+    """Sum usage tokens per calendar day for one session transcript.
+
+    Dedups by (message id, requestId) so streaming/retry duplicate lines
+    aren't counted twice. Tokens = input + output + cache creation + cache
+    read, matching how ccusage totals a day."""
+    daily: dict[str, int] = {}
+    seen: set[str] = set()
+    try:
+        with open(fp, "r", errors="replace") as f:
+            for line in f:
+                if '"usage"' not in line:   # cheap prefilter; most lines skip
+                    continue
+                try:
+                    d = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                msg = d.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                u = msg.get("usage")
+                if not isinstance(u, dict):
+                    continue
+                mid = msg.get("id") or ""
+                key = f"{mid}:{d.get('requestId') or ''}"
+                if mid and key in seen:
+                    continue
+                seen.add(key)
+                day = (d.get("timestamp") or "")[:10]
+                if len(day) != 10:
+                    continue
+                daily[day] = daily.get(day, 0) + (
+                    u.get("input_tokens", 0)
+                    + u.get("output_tokens", 0)
+                    + u.get("cache_creation_input_tokens", 0)
+                    + u.get("cache_read_input_tokens", 0)
+                )
+    except OSError:
+        pass
+    return daily
+
+
+def compute_token_history(days: int = HISTORY_DAYS) -> list[int]:
+    """Scan all Claude Code transcripts, return the last `days` days of total
+    tokens (oldest -> newest, missing days = 0). Blocking IO — call via an
+    executor. A full scan of a few hundred MB is well under a second."""
+    totals: dict[str, int] = {}
+    try:
+        for fp in CLAUDE_PROJECTS_DIR.rglob("*.jsonl"):
+            for day, tok in _parse_file_daily(fp).items():
+                totals[day] = totals.get(day, 0) + tok
+    except OSError as e:
+        log(f"Token history scan error: {e}")
+    today = datetime.now().date()
+    return [totals.get(str(today - timedelta(days=i)), 0)
+            for i in range(days - 1, -1, -1)]
+
+
 async def poll_api(token: str) -> dict | None:
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
@@ -747,6 +811,8 @@ class Session:
         # Watchdog: bumped whenever the main loop makes progress. If it goes
         # stale the watchdog task force-disconnects to unwedge a hung await.
         self.last_progress: float = time.time()
+        self.last_history_at: float = 0.0
+        self.last_history_sig: str | None = None
 
     def note_progress(self) -> None:
         self.last_progress = time.time()
@@ -802,6 +868,30 @@ class Session:
         except (BleakError, asyncio.TimeoutError) as e:
             log(f"Write failed: {e}")
             return False
+
+    async def maybe_send_token_history(self) -> None:
+        """Every HISTORY_INTERVAL_S, recompute the daily token history off the
+        BLE thread and push it as {"tk":[...]} (units of 100k tokens, oldest
+        -> newest) only when it changed."""
+        now = time.time()
+        if self.last_history_at and now - self.last_history_at < HISTORY_INTERVAL_S:
+            return
+        self.last_history_at = now
+        loop = asyncio.get_running_loop()
+        try:
+            raw = await loop.run_in_executor(
+                None, compute_token_history, HISTORY_DAYS
+            )
+        except Exception as e:
+            log(f"Token history compute failed: {e}")
+            return
+        vals = [min(round(t / TOKEN_UNIT), 65535) for t in raw]
+        sig = ",".join(map(str, vals))
+        if sig == self.last_history_sig:
+            return
+        if await self.write_payload({"tk": vals}):
+            self.last_history_sig = sig
+            log(f"Token history sent ({sum(raw):,} tok over {len(vals)}d)")
 
     async def quick_bt_acc_sync(self) -> None:
         """system_profiler is slow (~1 s), so poll the BT accessory list at
@@ -1096,6 +1186,7 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
             await session.quick_afk_sync()
             await session.quick_attention_sync()
             await session.quick_bt_acc_sync()
+            await session.maybe_send_token_history()
             await session.maybe_send_photo()
 
             try:
