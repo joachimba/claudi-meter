@@ -690,13 +690,49 @@ async def scan_for_device() -> str | None:
     return None
 
 
-def _parse_file_daily(fp: Path) -> dict[str, int]:
-    """Sum usage tokens per calendar day for one session transcript.
+# Per-token USD rates by model family, matching ccusage. Base is the
+# published $/1M input & output; cache write is 1.25x input (5-min TTL) or
+# 2x (1-hour), cache read is 0.1x input. These are equivalent API costs —
+# subscription/OAuth usage isn't billed per token, so the graph is a proxy.
+def _model_rates(model: str) -> tuple[float, float, float, float, float]:
+    """Return (input, output, cache_write_5m, cache_write_1h, cache_read)
+    in USD per million tokens for the model's family."""
+    m = (model or "").lower()
+    if "opus" in m:
+        inp, out = 5.0, 25.0
+    elif "haiku" in m:
+        inp, out = 1.0, 5.0
+    elif "fable" in m or "mythos" in m:
+        inp, out = 10.0, 50.0
+    else:  # sonnet and default
+        inp, out = 3.0, 15.0
+    return (inp, out, inp * 1.25, inp * 2.0, inp * 0.1)
+
+
+def _message_cost_usd(model: str, u: dict) -> float:
+    r = _model_rates(model)
+    cc = u.get("cache_creation") or {}
+    cw5 = cc.get("ephemeral_5m_input_tokens", 0)
+    cw1 = cc.get("ephemeral_1h_input_tokens", 0)
+    if not (cw5 or cw1):   # older lines lack the breakdown — treat all as 5m
+        cw5 = u.get("cache_creation_input_tokens", 0)
+    return (
+        u.get("input_tokens", 0) * r[0]
+        + u.get("output_tokens", 0) * r[1]
+        + cw5 * r[2]
+        + cw1 * r[3]
+        + u.get("cache_read_input_tokens", 0) * r[4]
+    ) / 1_000_000.0
+
+
+def _parse_file_daily(fp: Path) -> dict[str, list]:
+    """Sum usage tokens and equivalent USD cost per calendar day for one
+    session transcript. Returns {date: [tokens, cost_usd]}.
 
     Dedups by (message id, requestId) so streaming/retry duplicate lines
     aren't counted twice. Tokens = input + output + cache creation + cache
-    read, matching how ccusage totals a day."""
-    daily: dict[str, int] = {}
+    read; cost uses per-model rates, matching how ccusage totals a day."""
+    daily: dict[str, list] = {}
     seen: set[str] = set()
     try:
         with open(fp, "r", errors="replace") as f:
@@ -721,31 +757,41 @@ def _parse_file_daily(fp: Path) -> dict[str, int]:
                 day = (d.get("timestamp") or "")[:10]
                 if len(day) != 10:
                     continue
-                daily[day] = daily.get(day, 0) + (
+                tok = (
                     u.get("input_tokens", 0)
                     + u.get("output_tokens", 0)
                     + u.get("cache_creation_input_tokens", 0)
                     + u.get("cache_read_input_tokens", 0)
                 )
+                cost = _message_cost_usd(msg.get("model", ""), u)
+                bucket = daily.setdefault(day, [0, 0.0])
+                bucket[0] += tok
+                bucket[1] += cost
     except OSError:
         pass
     return daily
 
 
-def compute_token_history(days: int = HISTORY_DAYS) -> list[int]:
-    """Scan all Claude Code transcripts, return the last `days` days of total
-    tokens (oldest -> newest, missing days = 0). Blocking IO — call via an
-    executor. A full scan of a few hundred MB is well under a second."""
-    totals: dict[str, int] = {}
+def compute_token_history(days: int = HISTORY_DAYS) -> tuple[list[int], list[int]]:
+    """Scan all Claude Code transcripts, return the last `days` days as
+    (tokens, cost_cents), oldest -> newest, missing days = 0. Blocking IO —
+    call via an executor. A full scan of a few hundred MB is under a second."""
+    totals: dict[str, list] = {}
     try:
         for fp in CLAUDE_PROJECTS_DIR.rglob("*.jsonl"):
-            for day, tok in _parse_file_daily(fp).items():
-                totals[day] = totals.get(day, 0) + tok
+            for day, (tok, cost) in _parse_file_daily(fp).items():
+                bucket = totals.setdefault(day, [0, 0.0])
+                bucket[0] += tok
+                bucket[1] += cost
     except OSError as e:
         log(f"Token history scan error: {e}")
     today = datetime.now().date()
-    return [totals.get(str(today - timedelta(days=i)), 0)
-            for i in range(days - 1, -1, -1)]
+    tokens, cost_cents = [], []
+    for i in range(days - 1, -1, -1):
+        b = totals.get(str(today - timedelta(days=i)), [0, 0.0])
+        tokens.append(b[0])
+        cost_cents.append(int(round(b[1] * 100)))
+    return tokens, cost_cents
 
 
 async def poll_api(token: str) -> dict | None:
@@ -879,19 +925,28 @@ class Session:
         self.last_history_at = now
         loop = asyncio.get_running_loop()
         try:
-            raw = await loop.run_in_executor(
+            raw, cost_cents = await loop.run_in_executor(
                 None, compute_token_history, HISTORY_DAYS
             )
         except Exception as e:
             log(f"Token history compute failed: {e}")
             return
         vals = [min(round(t / TOKEN_UNIT), 65535) for t in raw]
-        sig = ",".join(map(str, vals))
+        cents = [max(c, 0) for c in cost_cents]
+        sig = ",".join(map(str, vals)) + "|" + ",".join(map(str, cents))
         if sig == self.last_history_sig:
             return
-        if await self.write_payload({"tk": vals}):
+        # Two separate writes — a combined {tk,ck} payload (~380B) exceeds the
+        # BLE MTU. The firmware has a single RX buffer, so pause between writes
+        # to let its loop consume `tk` before `ck` overwrites it (otherwise the
+        # token payload is lost and the graph never marks itself valid).
+        ok_tk = await self.write_payload({"tk": vals})
+        await asyncio.sleep(0.2)
+        ok_ck = await self.write_payload({"ck": cents})
+        if ok_tk and ok_ck:
             self.last_history_sig = sig
-            log(f"Token history sent ({sum(raw):,} tok over {len(vals)}d)")
+            log(f"Token history sent ({sum(raw):,} tok, "
+                f"${sum(cost_cents)/100:,.0f} over {len(vals)}d)")
 
     async def quick_bt_acc_sync(self) -> None:
         """system_profiler is slow (~1 s), so poll the BT accessory list at

@@ -35,8 +35,10 @@ struct PhotoData {
 struct HistoryData {
     // Daily token usage, oldest -> newest, in units of 100k tokens.
     uint16_t vals[HISTORY_MAX_DAYS];
-    uint8_t  count;   // number of valid entries (<= HISTORY_MAX_DAYS)
+    uint32_t cost_cents[HISTORY_MAX_DAYS];  // equivalent USD cost per day, in cents
+    uint8_t  count;        // number of valid token entries (<= HISTORY_MAX_DAYS)
     bool     valid;
+    bool     cost_valid;   // true once a cost ("ck") payload has arrived
 };
 
 #define BT_ACC_MAX 6

@@ -119,12 +119,14 @@ static lv_obj_t* btacc_empty_label;
 
 // ---- Usage History (daily token graph) screen ----
 #define HG_W 440          // graph canvas width
-#define HG_H 236          // graph canvas height
+#define HG_H 200          // graph canvas height
 #define HG_PAD_TOP 16     // keep the peak off the top edge
+#define HG_BOTTOM_INSET 22 // clear the rounded display corners below the graph
 static lv_obj_t* history_container = nullptr;
 static lv_obj_t* lbl_hist_caption  = nullptr;   // "TOKENS / DAY"
+static lv_obj_t* lbl_hist_total    = nullptr;   // 30-day equivalent-cost total (top-right)
 static lv_obj_t* lbl_hist_value    = nullptr;   // big headline (today)
-static lv_obj_t* lbl_hist_delta    = nullptr;   // vs yesterday
+static lv_obj_t* lbl_hist_delta    = nullptr;   // vs yesterday + today's cost
 static lv_obj_t* history_canvas    = nullptr;
 static uint16_t* history_buf       = nullptr;
 static HistoryData history_data    = {};        // last payload, kept for redraw
@@ -395,6 +397,13 @@ static void hg_format_tokens(uint32_t tok, char* buf, size_t n) {
     else                          snprintf(buf, n, "%lu", (unsigned long)tok);
 }
 
+// Format a cent amount into a compact dollar string: $2.2K / $340 / $5.20.
+static void hg_format_usd(uint32_t cents, char* buf, size_t n) {
+    if (cents >= 100000UL)   snprintf(buf, n, "$%.1fK", cents / 100000.0);  // >= $1000
+    else if (cents >= 1000UL) snprintf(buf, n, "$%lu", (unsigned long)(cents / 100)); // >= $10
+    else                     snprintf(buf, n, "$%.2f", cents / 100.0);
+}
+
 // Redraw the graph from history_data into history_buf.
 static void render_history_graph(void) {
     if (!history_buf) return;
@@ -503,6 +512,14 @@ static void init_history_screen(lv_obj_t* scr) {
     lv_obj_set_style_text_letter_space(lbl_hist_caption, 3, 0);
     lv_obj_set_pos(lbl_hist_caption, MARGIN, 104);
 
+    // 30-day equivalent-cost total, right-aligned on the caption row.
+    lbl_hist_total = lv_label_create(history_container);
+    lv_label_set_text(lbl_hist_total, "");
+    lv_obj_set_style_text_font(lbl_hist_total, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_hist_total, COL_DIM, 0);
+    lv_obj_set_style_text_letter_space(lbl_hist_total, 2, 0);
+    lv_obj_align(lbl_hist_total, LV_ALIGN_TOP_RIGHT, -MARGIN, 106);
+
     lbl_hist_value = lv_label_create(history_container);
     lv_label_set_text(lbl_hist_value, "--");
     lv_obj_set_style_text_font(lbl_hist_value, &font_tiempos_56, 0);
@@ -522,7 +539,8 @@ static void init_history_screen(lv_obj_t* scr) {
         history_canvas = lv_canvas_create(history_container);
         lv_canvas_set_buffer(history_canvas, history_buf, HG_W, HG_H,
                              LV_COLOR_FORMAT_RGB565);
-        lv_obj_set_pos(history_canvas, MARGIN, SCR_H - HG_H);
+        // Inset from the bottom so the curve baseline clears the rounded corners.
+        lv_obj_set_pos(history_canvas, MARGIN, SCR_H - HG_H - HG_BOTTOM_INSET);
     }
 
     lv_obj_add_flag(history_container, LV_OBJ_FLAG_HIDDEN);
@@ -540,20 +558,37 @@ void ui_update_history(const HistoryData* data) {
     hg_format_tokens(today, buf, sizeof(buf));
     lv_label_set_text(lbl_hist_value, buf);
 
+    // Delta vs yesterday, plus today's equivalent cost when available.
+    char db[64], tb[24];
+    long delta = 0;
     if (n >= 2) {
         long yest = (long)history_data.vals[n - 2] * 100000L;
-        long delta = (long)today - yest;
-        char db[48], tb[24];
+        delta = (long)today - yest;
         hg_format_tokens((uint32_t)(delta < 0 ? -delta : delta), tb, sizeof(tb));
-        if (yest > 0) {
-            int pctv = (int)(delta * 100 / yest);
-            snprintf(db, sizeof(db), "%s%s (%d%%)", delta >= 0 ? "+" : "-", tb, pctv);
-        } else {
-            snprintf(db, sizeof(db), "%s%s", delta >= 0 ? "+" : "-", tb);
-        }
-        lv_label_set_text(lbl_hist_delta, db);
-        lv_obj_set_style_text_color(lbl_hist_delta,
-                                    delta >= 0 ? COL_GREEN : COL_RED, 0);
+        snprintf(db, sizeof(db), "%s%s", delta >= 0 ? "+" : "-", tb);
+    } else {
+        db[0] = '\0';
+    }
+    if (history_data.cost_valid) {
+        char cb[24];
+        hg_format_usd(history_data.cost_cents[n - 1], cb, sizeof(cb));
+        size_t len = strlen(db);
+        // ASCII "~" for approx — the font subset lacks ≈ and · glyphs.
+        snprintf(db + len, sizeof(db) - len, "%s~%s today",
+                 len ? "   " : "", cb);
+    }
+    lv_label_set_text(lbl_hist_delta, db);
+    lv_obj_set_style_text_color(lbl_hist_delta,
+                                delta >= 0 ? COL_GREEN : COL_RED, 0);
+
+    // 30-day equivalent-cost total, top-right.
+    if (history_data.cost_valid) {
+        uint32_t total = 0;
+        for (int i = 0; i < n; i++) total += history_data.cost_cents[i];
+        char tot[24], cb[20];
+        hg_format_usd(total, cb, sizeof(cb));
+        snprintf(tot, sizeof(tot), "%s / 30D", cb);
+        lv_label_set_text(lbl_hist_total, tot);
     }
 
     render_history_graph();

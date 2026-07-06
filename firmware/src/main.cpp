@@ -242,6 +242,16 @@ static bool parse_json(const char* json, UsageData* u, SpotifyData* sp,
         hist->valid = true;
     }
 
+    if (doc["ck"].is<JsonArrayConst>()) {
+        JsonArrayConst arr = doc["ck"].as<JsonArrayConst>();
+        uint8_t i = 0;
+        for (JsonVariantConst v : arr) {
+            if (i >= HISTORY_MAX_DAYS) break;
+            hist->cost_cents[i++] = (uint32_t)(v.as<unsigned long>());
+        }
+        hist->cost_valid = true;
+    }
+
     return true;
 }
 
