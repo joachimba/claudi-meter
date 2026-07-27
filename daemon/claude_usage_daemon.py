@@ -86,18 +86,32 @@ VACATION_FILE = CONFIG_DIR / "vacation.json"       # {"destination": "...", "dat
 UNSPLASH_KEY_FILE = CONFIG_DIR / "unsplash-key"    # one line: the access key (or $UNSPLASH_ACCESS_KEY)
 VACATION_INTERVAL_S = 60     # re-evaluate the countdown at most this often
 UNSPLASH_SEARCH = "https://api.unsplash.com/search/photos"
-# Bias the backdrop toward places, not portraits/wildlife.
-UNSPLASH_BIAS = "cityscape landscape scenery architecture skyline"
-UNSPLASH_REJECT = (
-    "people", "person", "portrait", "human", "man", "woman", "women", "men",
-    "boy", "girl", "child", "kid", "face", "crowd", "selfie", "model",
-    "animal", "wildlife", "dog", "cat", "pet", "bird", "horse", "lion",
-)
-UNSPLASH_PREFER = (
-    "city", "cityscape", "skyline", "architecture", "building", "landscape",
-    "nature", "mountain", "scenery", "street", "aerial", "landmark", "coast",
-    "skyscraper", "temple", "sea", "beach", "sunset", "travel",
-)
+# Bias the backdrop toward places, not portraits/wildlife — applied by
+# filtering the result set (not by narrowing the search query). Matched at
+# WORD level (a token set), so "cat" won't hit "location" nor "men" "monument".
+UNSPLASH_REJECT = frozenset((
+    # people
+    "people", "person", "persons", "portrait", "human", "humans", "man", "men",
+    "woman", "women", "boy", "girl", "child", "children", "kid", "kids", "face",
+    "crowd", "selfie", "model", "family", "couple", "tourist", "tourists",
+    "hiker", "hikers", "girls", "boys", "lady",
+    # animals
+    "animal", "animals", "wildlife", "safari", "herd", "flock", "dog", "dogs",
+    "cat", "cats", "pet", "pets", "bird", "birds", "horse", "horses", "lion",
+    "lions", "elephant", "elephants", "giraffe", "zebra", "zebras", "leopard",
+    "rhino", "antelope", "oryx", "springbok", "cheetah", "buffalo", "monkey",
+    "baboon", "meerkat", "ostrich", "seal", "seals", "whale", "dolphin",
+    "penguin", "penguins", "deer", "sheep", "cattle", "cow", "cows", "goat",
+    "fox", "bear", "tiger", "snake", "insect", "butterfly", "fish", "flamingo",
+    "flamingos",
+))
+UNSPLASH_PREFER = frozenset((
+    "city", "cityscape", "skyline", "architecture", "building", "buildings",
+    "landscape", "landscapes", "nature", "mountain", "mountains", "scenery",
+    "street", "aerial", "landmark", "coast", "coastline", "skyscraper",
+    "temple", "sea", "beach", "sunset", "desert", "dunes", "valley", "forest",
+    "waterfall", "lake", "river", "cliff", "canyon", "travel", "architecture",
+))
 
 CONNECT_TIMEOUT = 20.0   # bound client.connect(); a half-open link must not hang forever
 BLE_WRITE_TIMEOUT = 10.0  # bound every GATT write; a stuck write -> teardown + reconnect
@@ -857,28 +871,30 @@ def load_vacation() -> dict | None:
     }
 
 
-def _photo_text(photo: dict) -> str:
-    """Lowercase blob of a photo's tags + descriptions, for keyword matching."""
+def _photo_tokens(photo: dict) -> set:
+    """Word tokens from a photo's tags + descriptions, lowercased."""
     parts = [photo.get("description") or "", photo.get("alt_description") or ""]
     for t in (photo.get("tags") or []):
         if isinstance(t, dict):
             parts.append(t.get("title") or "")
-    return " ".join(parts).lower()
+    return set(re.split(r"[^a-z0-9]+", " ".join(parts).lower()))
 
 
 def _pick_place_photo(results: list) -> dict | None:
     """Prefer landscape/city photos; skip anything tagged people or animals.
-    Falls back to the top relevance result if everything gets filtered."""
+    Word-level matching. Falls back to top relevance if everything is filtered."""
     scored = []
     for p in results:
-        txt = _photo_text(p)
-        reject = any(w in txt for w in UNSPLASH_REJECT)
-        prefer = any(w in txt for w in UNSPLASH_PREFER)
+        toks = _photo_tokens(p)
+        reject = bool(toks & UNSPLASH_REJECT)
+        prefer = bool(toks & UNSPLASH_PREFER)
         scored.append((p, reject, prefer))
+    preferred = [p for (p, rej, pref) in scored if not rej and pref]
+    if preferred:
+        return preferred[0]
     clean = [p for (p, rej, _) in scored if not rej]
     if clean:
-        preferred = [p for (p, rej, pref) in scored if not rej and pref]
-        return preferred[0] if preferred else clean[0]
+        return clean[0]
     return results[0] if results else None   # fallback: nothing passed
 
 
@@ -888,8 +904,11 @@ async def _unsplash_image_url(query: str, key: str) -> str | None:
     download-tracking guideline."""
     headers = {"Authorization": f"Client-ID {key}",
                "Accept-Version": "v1"}
-    params = {"query": f"{query} {UNSPLASH_BIAS}", "orientation": "squarish",
-              "per_page": "24", "content_filter": "high"}
+    # Search the plain destination (adding bias words to the query starves
+    # non-city places like "Namibia" of results); the people/animal filtering
+    # and landscape preference happen on the result set in _pick_place_photo.
+    params = {"query": query, "orientation": "squarish",
+              "per_page": "30", "content_filter": "high"}
     try:
         async with httpx.AsyncClient(timeout=15.0) as http:
             r = await http.get(UNSPLASH_SEARCH, headers=headers, params=params)
