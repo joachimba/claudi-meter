@@ -698,15 +698,15 @@ static void init_vacation_screen(lv_obj_t* scr) {
     lv_obj_set_width(lbl_vac_caption, SCR_W);
     lv_obj_set_pos(lbl_vac_caption, 0, tiles_y + VAC_TILE_H + 14);
 
-    // Destination, centered under the caption.
+    // Destination — big, centered, anchored near the bottom edge.
     lbl_vac_dest = lv_label_create(vacation_container);
     lv_label_set_text(lbl_vac_dest, "");
-    lv_obj_set_style_text_font(lbl_vac_dest, &font_styrene_28, 0);
+    lv_obj_set_style_text_font(lbl_vac_dest, &font_styrene_48, 0);
     lv_obj_set_style_text_color(lbl_vac_dest, lv_color_hex(0xffffff), 0);
     lv_obj_set_style_text_align(lbl_vac_dest, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(lbl_vac_dest, LV_LABEL_LONG_DOT);
     lv_obj_set_width(lbl_vac_dest, CONTENT_W);
-    lv_obj_set_pos(lbl_vac_dest, MARGIN, tiles_y + VAC_TILE_H + 48);
+    lv_obj_align(lbl_vac_dest, LV_ALIGN_BOTTOM_MID, 0, -42);
 
     // Placeholder shown when no trip is configured.
     lbl_vac_empty = lv_label_create(vacation_container);
