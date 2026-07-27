@@ -40,6 +40,12 @@ bool ble_photo_transferring(void);     // true while chunks are mid-flight
 const uint8_t* ble_photo_data(void);
 void ble_photo_consume(void);
 
+// Vacation backdrop (RGB565, 480x480) — same chunk framing as PHOTO on its
+// own characteristic + buffer, so the countdown screen keeps a stable image.
+bool ble_vacimg_ready(void);
+const uint8_t* ble_vacimg_data(void);  // RGB565, BLE_PHOTO_W*BLE_PHOTO_H*2 bytes
+void ble_vacimg_consume(void);
+
 // Device→daemon commands over CMD characteristic. Single-byte payload.
 enum ble_cmd_t : uint8_t {
     BLE_CMD_SPOTIFY_PLAYPAUSE = 0x01,

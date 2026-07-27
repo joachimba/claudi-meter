@@ -36,6 +36,7 @@ static CalendarData calendar = {};
 static PhotoData photo = {};
 static BTAccessoriesData bt_acc = {};
 static HistoryData history = {};
+static VacationData vacation = {};
 
 // ---- Touch interrupt + shared state ----
 static volatile bool     touch_pressed = false;
@@ -167,7 +168,7 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
 // unchanged so a partial update doesn't blank existing UI state.
 static bool parse_json(const char* json, UsageData* u, SpotifyData* sp,
                        CalendarData* cal, PhotoData* pho, BTAccessoriesData* bta,
-                       HistoryData* hist) {
+                       HistoryData* hist, VacationData* vac) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
@@ -240,6 +241,15 @@ static bool parse_json(const char* json, UsageData* u, SpotifyData* sp,
             hist->vals[hist->count++] = (uint16_t)(v.as<unsigned int>());
         }
         hist->valid = true;
+    }
+
+    if (doc["vac"].is<JsonObjectConst>()) {
+        JsonObjectConst v = doc["vac"].as<JsonObjectConst>();
+        strlcpy(vac->destination, v["dst"] | "", sizeof(vac->destination));
+        strlcpy(vac->date_label, v["dl"] | "", sizeof(vac->date_label));
+        vac->days = v["d"] | 0;
+        vac->active = v["a"] | false;
+        vac->valid = true;
     }
 
     if (doc["ck"].is<JsonArrayConst>()) {
@@ -517,7 +527,7 @@ void loop() {
     // Process incoming BLE data
     if (ble_has_data()) {
         oled_protect_note_activity();
-        if (parse_json(ble_get_data(), &usage, &spotify, &calendar, &photo, &bt_acc, &history)) {
+        if (parse_json(ble_get_data(), &usage, &spotify, &calendar, &photo, &bt_acc, &history, &vacation)) {
             int g_before = usage_rate_group();
             usage_rate_sample(usage.session_pct);
             int g_after = usage_rate_group();
@@ -537,6 +547,7 @@ void loop() {
             ui_update_photo_caption(&photo);
             ui_update_bt_accessories(&bt_acc);
             ui_update_history(&history);
+            ui_update_vacation(&vacation);
             ble_send_ack();
         } else {
             ble_send_nack();
@@ -553,6 +564,12 @@ void loop() {
     if (ble_photo_ready()) {
         ui_update_photo_image(ble_photo_data());
         ble_photo_consume();
+    }
+
+    // Vacation backdrop reassembled on its own GATT char.
+    if (ble_vacimg_ready()) {
+        ui_update_vacation_image(ble_vacimg_data());
+        ble_vacimg_consume();
     }
 
     // Hide the canvas while a new photo is mid-transfer so the user doesn't

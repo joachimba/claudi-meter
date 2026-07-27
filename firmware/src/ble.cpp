@@ -14,6 +14,7 @@
 #define IMG_CHAR_UUID       "4c41555a-4465-7669-6365-000000000005"  // album art chunks
 #define CMD_CHAR_UUID       "4c41555a-4465-7669-6365-000000000006"  // device-initiated commands (1-byte notify)
 #define PHOTO_CHAR_UUID     "4c41555a-4465-7669-6365-000000000007"  // ambient photo chunks
+#define VACIMG_CHAR_UUID    "4c41555a-4465-7669-6365-000000000008"  // vacation backdrop chunks
 
 #define BLE_BUF_SIZE 512
 #define BLE_IMG_BYTES   (BLE_ART_W   * BLE_ART_H   * 2)
@@ -110,6 +111,16 @@ static uint16_t  photo_active_hash = 0;
 static uint32_t  photo_expected_total = 0;
 static uint32_t  photo_received_bytes = 0;
 static volatile bool photo_ready = false;
+
+// Vacation backdrop — same 480x480 RGB565 reassembly as PHOTO, on its own
+// characteristic + buffer so the countdown screen keeps a stable image while
+// the ambient-photo screen keeps rotating.
+static NimBLECharacteristic* vacimg_char = nullptr;
+static uint8_t*  vacimg_buf = nullptr;
+static uint16_t  vacimg_active_hash = 0;
+static uint32_t  vacimg_expected_total = 0;
+static uint32_t  vacimg_received_bytes = 0;
+static volatile bool vacimg_ready = false;
 
 static void start_advertising() {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -222,6 +233,41 @@ class PhotoCallbacks : public NimBLECharacteristicCallbacks {
         photo_received_bytes += payload_len;
         if (photo_received_bytes >= photo_expected_total) {
             photo_ready = true;
+        }
+    }
+};
+
+class VacimgCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& info) override {
+        if (!vacimg_buf) return;
+        std::string val = chr->getValue();
+        const uint8_t* p = (const uint8_t*)val.data();
+        size_t len = val.length();
+        if (len < PHOTO_HDR_SIZE) return;
+
+        uint16_t hash =
+            (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+        uint32_t offset =
+            (uint32_t)p[2] | ((uint32_t)p[3] << 8) |
+            ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 24);
+        uint32_t total =
+            (uint32_t)p[6] | ((uint32_t)p[7] << 8) |
+            ((uint32_t)p[8] << 16) | ((uint32_t)p[9] << 24);
+        size_t payload_len = len - PHOTO_HDR_SIZE;
+
+        if (total != BLE_PHOTO_BYTES) return;
+        if (offset + payload_len > BLE_PHOTO_BYTES) return;
+
+        if (hash != vacimg_active_hash || offset == 0) {
+            vacimg_active_hash = hash;
+            vacimg_expected_total = total;
+            vacimg_received_bytes = 0;
+            vacimg_ready = false;
+        }
+        memcpy(vacimg_buf + offset, p + PHOTO_HDR_SIZE, payload_len);
+        vacimg_received_bytes += payload_len;
+        if (vacimg_received_bytes >= vacimg_expected_total) {
+            vacimg_ready = true;
         }
     }
 };
@@ -345,6 +391,19 @@ void ble_init(void) {
     static PhotoCallbacks photoCb;
     photo_char->setCallbacks(&photoCb);
 
+    vacimg_char = svc->createCharacteristic(
+        VACIMG_CHAR_UUID,
+        NIMBLE_PROPERTY::WRITE
+    );
+    static VacimgCallbacks vacimgCb;
+    vacimg_char->setCallbacks(&vacimgCb);
+    vacimg_buf = (uint8_t*)heap_caps_malloc(BLE_PHOTO_BYTES, MALLOC_CAP_SPIRAM);
+    if (!vacimg_buf) {
+        Serial.println("BLE: vacimg_buf PSRAM alloc failed");
+    } else {
+        memset(vacimg_buf, 0, BLE_PHOTO_BYTES);
+    }
+
     photo_buf = (uint8_t*)heap_caps_malloc(BLE_PHOTO_BYTES, MALLOC_CAP_SPIRAM);
     if (!photo_buf) {
         Serial.println("BLE: photo_buf PSRAM alloc failed");
@@ -431,6 +490,10 @@ bool ble_photo_transferring(void) {
 }
 const uint8_t* ble_photo_data(void)   { return photo_buf; }
 void ble_photo_consume(void)          { photo_ready = false; }
+
+bool ble_vacimg_ready(void)           { return vacimg_ready; }
+const uint8_t* ble_vacimg_data(void)  { return vacimg_buf; }
+void ble_vacimg_consume(void)         { vacimg_ready = false; }
 
 void ble_request_refresh(void) {
     if (state == BLE_STATE_CONNECTED && req_char) {

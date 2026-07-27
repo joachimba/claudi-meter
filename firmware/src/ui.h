@@ -6,6 +6,7 @@ enum screen_t {
     SCREEN_SPLASH,
     SCREEN_USAGE,
     SCREEN_HISTORY,
+    SCREEN_VACATION,
     SCREEN_SPOTIFY,
     SCREEN_CALENDAR,
     SCREEN_POMODORO,
@@ -25,6 +26,8 @@ void ui_update_photo_caption(const PhotoData* data);
 void ui_update_photo_image(const uint8_t* rgb565);
 void ui_update_bt_accessories(const BTAccessoriesData* data);
 void ui_update_history(const HistoryData* data);
+void ui_update_vacation(const VacationData* data);
+void ui_update_vacation_image(const uint8_t* rgb565);
 void ui_set_afk(bool on);
 void ui_set_attention(bool on);   // bounce the top-left Clawd logo when Claude Code needs you
 void ui_refresh_settings(void);   // sync Settings screen widgets to settings.cpp state

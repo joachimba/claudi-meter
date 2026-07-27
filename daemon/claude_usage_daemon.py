@@ -35,6 +35,7 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 IMG_CHAR_UUID   = "4c41555a-4465-7669-6365-000000000005"
 CMD_CHAR_UUID   = "4c41555a-4465-7669-6365-000000000006"
 PHOTO_CHAR_UUID = "4c41555a-4465-7669-6365-000000000007"
+VACIMG_CHAR_UUID = "4c41555a-4465-7669-6365-000000000008"
 
 # Ambient photo screen sizing + cadence.
 PHOTO_W = 480
@@ -79,6 +80,13 @@ POLL_INTERVAL = 60
 TICK = 3
 SPOTIFY_TICK = 3   # how often to poll Spotify.app between full API polls
 SCAN_TIMEOUT = 8.0
+# --- Vacation countdown ---
+CONFIG_DIR = Path.home() / ".config" / "claude-usage-monitor"
+VACATION_FILE = CONFIG_DIR / "vacation.json"       # {"destination": "...", "date": "YYYY-MM-DD"}
+UNSPLASH_KEY_FILE = CONFIG_DIR / "unsplash-key"    # one line: the access key (or $UNSPLASH_ACCESS_KEY)
+VACATION_INTERVAL_S = 60     # re-evaluate the countdown at most this often
+UNSPLASH_SEARCH = "https://api.unsplash.com/search/photos"
+
 CONNECT_TIMEOUT = 20.0   # bound client.connect(); a half-open link must not hang forever
 BLE_WRITE_TIMEOUT = 10.0  # bound every GATT write; a stuck write -> teardown + reconnect
 WATCHDOG_STALL_S = 45.0   # no main-loop progress this long -> force disconnect (unwedge)
@@ -794,6 +802,83 @@ def compute_token_history(days: int = HISTORY_DAYS) -> tuple[list[int], list[int
     return tokens, cost_cents
 
 
+def _unsplash_key() -> str | None:
+    key = os.environ.get("UNSPLASH_ACCESS_KEY")
+    if key:
+        return key.strip()
+    try:
+        return UNSPLASH_KEY_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def load_vacation() -> dict | None:
+    """Read the vacation config and compute the countdown. Returns None if no
+    trip is configured or the file is malformed.
+
+    Config: {"destination": "Tokyo, Japan", "date": "2026-09-01",
+             "query": "Tokyo skyline" (optional image-search override)}"""
+    try:
+        raw = VACATION_FILE.read_text()
+    except OSError:
+        return None
+    try:
+        cfg = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        log("vacation.json is not valid JSON")
+        return None
+    dest = (cfg.get("destination") or "").strip()
+    date_str = (cfg.get("date") or "").strip()
+    if not dest or not date_str:
+        return None
+    try:
+        trip = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        log(f"vacation.json: bad date {date_str!r} (want YYYY-MM-DD)")
+        return None
+    days = (trip - datetime.now().date()).days
+    return {
+        "destination": dest[:63],
+        "days": days,
+        "date_label": f"{trip.day} {trip.strftime('%b %Y')}",  # "1 Sep 2026"
+        "query": (cfg.get("query") or dest).strip(),
+    }
+
+
+async def _unsplash_image_url(query: str, key: str) -> str | None:
+    """Resolve a square destination photo URL via the Unsplash search API,
+    honouring the download-tracking guideline."""
+    headers = {"Authorization": f"Client-ID {key}",
+               "Accept-Version": "v1"}
+    params = {"query": query, "orientation": "squarish",
+              "per_page": "1", "content_filter": "high"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            r = await http.get(UNSPLASH_SEARCH, headers=headers, params=params)
+            if r.status_code != 200:
+                log(f"Unsplash HTTP {r.status_code}: {r.text[:120]}")
+                return None
+            results = r.json().get("results") or []
+            if not results:
+                log(f"Unsplash: no photo for {query!r}")
+                return None
+            photo = results[0]
+            # Attribution guideline: ping the download endpoint (fire-and-forget).
+            dl = (photo.get("links") or {}).get("download_location")
+            if dl:
+                try:
+                    await http.get(dl, headers=headers)
+                except httpx.HTTPError:
+                    pass
+            raw = (photo.get("urls") or {}).get("raw")
+            if not raw:
+                return None
+            return raw + "&w=480&h=480&fit=crop&crop=entropy&fm=jpg&q=80"
+    except httpx.HTTPError as e:
+        log(f"Unsplash request failed: {e}")
+        return None
+
+
 async def poll_api(token: str) -> dict | None:
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
@@ -859,6 +944,10 @@ class Session:
         self.last_progress: float = time.time()
         self.last_history_at: float = 0.0
         self.last_history_sig: str | None = None
+        self.last_vacation_at: float = 0.0
+        self.last_vacation_sig: str | None = None
+        self.last_vacation_dest: str | None = None
+        self.vacation_img_task: asyncio.Task | None = None
 
     def note_progress(self) -> None:
         self.last_progress = time.time()
@@ -947,6 +1036,62 @@ class Session:
             self.last_history_sig = sig
             log(f"Token history sent ({sum(raw):,} tok, "
                 f"${sum(cost_cents)/100:,.0f} over {len(vals)}d)")
+
+    async def maybe_send_vacation(self) -> None:
+        """Push the vacation countdown as {"vac":{...}} and, when the
+        destination changes, the Unsplash backdrop over the VACIMG char."""
+        now = time.time()
+        if self.last_vacation_at and now - self.last_vacation_at < VACATION_INTERVAL_S:
+            return
+        self.last_vacation_at = now
+        vac = load_vacation()
+        if vac is None:
+            if self.last_vacation_sig != "inactive":
+                if await self.write_payload({"vac": {"a": False}}):
+                    self.last_vacation_sig = "inactive"
+                    self.last_vacation_dest = None
+            return
+        sig = f"{vac['destination']}|{vac['date_label']}|{vac['days']}"
+        if sig != self.last_vacation_sig:
+            payload = {"vac": {"dst": vac["destination"], "dl": vac["date_label"],
+                               "d": vac["days"], "a": True}}
+            if await self.write_payload(payload):
+                self.last_vacation_sig = sig
+                log(f"Vacation: {vac['destination']} in {vac['days']}d")
+        # Fetch + push the backdrop only when the destination changes.
+        if vac["query"] != self.last_vacation_dest and (
+                not self.vacation_img_task or self.vacation_img_task.done()):
+            self.last_vacation_dest = vac["query"]
+            self.vacation_img_task = asyncio.create_task(
+                self._send_vacation_image(vac["query"]))
+
+    async def _send_vacation_image(self, query: str) -> None:
+        key = _unsplash_key()
+        if not key:
+            log("No Unsplash key — set UNSPLASH_ACCESS_KEY or write the key to "
+                f"{UNSPLASH_KEY_FILE}; skipping vacation backdrop")
+            self.last_vacation_dest = None   # retry once a key appears
+            return
+        url = await _unsplash_image_url(query, key)
+        if not url:
+            self.last_vacation_dest = None
+            return
+        pkg = await _fetch_photo_rgb565(url)
+        if pkg is None:
+            self.last_vacation_dest = None
+            return
+        rgb, _ = pkg
+        h = _url_hash16(url)
+        log(f"Sending vacation backdrop for {query!r} ({len(rgb)} bytes)")
+        try:
+            for offset in range(0, len(rgb), PHOTO_CHUNK_PAYLOAD):
+                chunk = rgb[offset:offset + PHOTO_CHUNK_PAYLOAD]
+                header = struct.pack("<HII", h, offset, len(rgb))
+                await self._ble_write(VACIMG_CHAR_UUID, header + chunk, response=True)
+            log("Vacation backdrop sent")
+        except (BleakError, asyncio.TimeoutError) as e:
+            log(f"Vacation backdrop send failed: {e}")
+            self.last_vacation_dest = None   # retry next cycle
 
     async def quick_bt_acc_sync(self) -> None:
         """system_profiler is slow (~1 s), so poll the BT accessory list at
@@ -1242,6 +1387,7 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
             await session.quick_attention_sync()
             await session.quick_bt_acc_sync()
             await session.maybe_send_token_history()
+            await session.maybe_send_vacation()
             await session.maybe_send_photo()
 
             try:
@@ -1260,6 +1406,12 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
             session.photo_task.cancel()
             try:
                 await session.photo_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if session.vacation_img_task and not session.vacation_img_task.done():
+            session.vacation_img_task.cancel()
+            try:
+                await session.vacation_img_task
             except (asyncio.CancelledError, Exception):
                 pass
         try:

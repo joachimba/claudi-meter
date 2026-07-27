@@ -131,6 +131,17 @@ static lv_obj_t* history_canvas    = nullptr;
 static uint16_t* history_buf       = nullptr;
 static HistoryData history_data    = {};        // last payload, kept for redraw
 
+// ---- Vacation countdown screen (Polarsteps-style: photo + big countdown) ----
+static lv_obj_t* vacation_container = nullptr;
+static lv_obj_t* vac_canvas        = nullptr;   // full-screen backdrop (BLE vacimg buffer)
+static lv_obj_t* vac_scrim         = nullptr;   // translucent panel behind the text
+static lv_obj_t* lbl_vac_days      = nullptr;   // big number ("36" / "TODAY")
+static lv_obj_t* lbl_vac_caption   = nullptr;   // "DAYS UNTIL" / "DAY UNTIL"
+static lv_obj_t* lbl_vac_dest      = nullptr;   // destination name
+static lv_obj_t* lbl_vac_date      = nullptr;   // date label
+static lv_obj_t* lbl_vac_empty     = nullptr;   // "No trip set" placeholder
+static bool      vac_have_image    = false;
+
 // ---- AFK overlay (sits above every screen when the host reports idle) ----
 #define AFK_ANIM_GRID 20
 #define AFK_ANIM_CELL 8
@@ -592,6 +603,123 @@ void ui_update_history(const HistoryData* data) {
     }
 
     render_history_graph();
+}
+
+// ======== Vacation Countdown Screen — photo backdrop + big countdown ========
+
+static void init_vacation_screen(lv_obj_t* scr) {
+    vacation_container = lv_obj_create(scr);
+    lv_obj_set_size(vacation_container, SCR_W, SCR_H);
+    lv_obj_set_pos(vacation_container, 0, 0);
+    lv_obj_set_style_bg_color(vacation_container, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(vacation_container, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(vacation_container, 0, 0);
+    lv_obj_set_style_pad_all(vacation_container, 0, 0);
+    lv_obj_clear_flag(vacation_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(vacation_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    // Full-screen RGB565 backdrop, backed by the BLE vacation-image buffer.
+    vac_canvas = lv_canvas_create(vacation_container);
+    lv_canvas_set_buffer(vac_canvas, (void*)ble_vacimg_data(),
+                         BLE_PHOTO_W, BLE_PHOTO_H, LV_COLOR_FORMAT_RGB565);
+    lv_obj_set_pos(vac_canvas, 0, 0);
+    lv_obj_set_style_pad_all(vac_canvas, 0, 0);
+    lv_obj_set_style_border_width(vac_canvas, 0, 0);
+    lv_obj_clear_flag(vac_canvas, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Bottom scrim so the countdown text stays legible over any photo.
+    vac_scrim = lv_obj_create(vacation_container);
+    lv_obj_set_size(vac_scrim, SCR_W, 210);
+    lv_obj_set_pos(vac_scrim, 0, SCR_H - 210);
+    lv_obj_set_style_bg_color(vac_scrim, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(vac_scrim, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(vac_scrim, 0, 0);
+    lv_obj_set_style_radius(vac_scrim, 0, 0);
+    lv_obj_clear_flag(vac_scrim, LV_OBJ_FLAG_SCROLLABLE);
+
+    // "DAYS UNTIL" caption.
+    lbl_vac_caption = lv_label_create(vacation_container);
+    lv_label_set_text(lbl_vac_caption, "");
+    lv_obj_set_style_text_font(lbl_vac_caption, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_vac_caption, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_letter_space(lbl_vac_caption, 3, 0);
+    lv_obj_set_pos(lbl_vac_caption, MARGIN + 4, SCR_H - 188);
+
+    // Big countdown number.
+    lbl_vac_days = lv_label_create(vacation_container);
+    lv_label_set_text(lbl_vac_days, "--");
+    lv_obj_set_style_text_font(lbl_vac_days, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(lbl_vac_days, lv_color_hex(0xffffff), 0);
+    lv_obj_set_pos(lbl_vac_days, MARGIN, SCR_H - 162);
+
+    // Destination.
+    lbl_vac_dest = lv_label_create(vacation_container);
+    lv_label_set_text(lbl_vac_dest, "");
+    lv_obj_set_style_text_font(lbl_vac_dest, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(lbl_vac_dest, lv_color_hex(0xffffff), 0);
+    lv_label_set_long_mode(lbl_vac_dest, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(lbl_vac_dest, CONTENT_W);
+    lv_obj_set_pos(lbl_vac_dest, MARGIN, SCR_H - 84);
+
+    // Date.
+    lbl_vac_date = lv_label_create(vacation_container);
+    lv_label_set_text(lbl_vac_date, "");
+    lv_obj_set_style_text_font(lbl_vac_date, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_vac_date, COL_DIM, 0);
+    lv_obj_set_pos(lbl_vac_date, MARGIN, SCR_H - 48);
+
+    // Placeholder shown when no trip is configured.
+    lbl_vac_empty = lv_label_create(vacation_container);
+    lv_label_set_text(lbl_vac_empty, "No trip set\nAdd one from the Mac menu");
+    lv_obj_set_style_text_font(lbl_vac_empty, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_vac_empty, COL_DIM, 0);
+    lv_obj_set_style_text_align(lbl_vac_empty, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl_vac_empty, LV_ALIGN_CENTER, 0, 40);
+    lv_obj_add_flag(lbl_vac_empty, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_add_flag(vacation_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Toggle the text/scrim widgets vs the "no trip" placeholder.
+static void vac_show_countdown(bool on) {
+    lv_obj_t* group[] = {vac_scrim, lbl_vac_caption, lbl_vac_days,
+                         lbl_vac_dest, lbl_vac_date};
+    for (lv_obj_t* o : group) {
+        if (!o) continue;
+        if (on) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+        else    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (lbl_vac_empty) {
+        if (on) lv_obj_add_flag(lbl_vac_empty, LV_OBJ_FLAG_HIDDEN);
+        else    lv_obj_clear_flag(lbl_vac_empty, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void ui_update_vacation(const VacationData* data) {
+    if (!data || !data->valid || !lbl_vac_days) return;
+
+    if (!data->active) {
+        vac_show_countdown(false);
+        return;
+    }
+    vac_show_countdown(true);
+
+    char num[16];
+    const char* cap;
+    if (data->days > 1)       { snprintf(num, sizeof(num), "%d", data->days); cap = "DAYS UNTIL"; }
+    else if (data->days == 1) { snprintf(num, sizeof(num), "1");              cap = "DAY UNTIL"; }
+    else if (data->days == 0) { snprintf(num, sizeof(num), "TODAY");          cap = "DEPARTURE DAY"; }
+    else                      { snprintf(num, sizeof(num), "DAY %d", -data->days + 1); cap = "UNDER WAY"; }
+    lv_label_set_text(lbl_vac_caption, cap);
+    lv_label_set_text(lbl_vac_days, num);
+    lv_label_set_text(lbl_vac_dest, data->destination);
+    lv_label_set_text(lbl_vac_date, data->date_label);
+}
+
+void ui_update_vacation_image(const uint8_t* rgb565) {
+    if (!vac_canvas || !rgb565) return;
+    vac_have_image = true;
+    lv_obj_invalidate(vac_canvas);
 }
 
 // ======== Bluetooth Screen (480x480) ========
@@ -1273,6 +1401,7 @@ void ui_init(void) {
 
     init_usage_screen(scr);
     init_history_screen(scr);
+    init_vacation_screen(scr);
     init_spotify_screen(scr);
     init_calendar_screen(scr);
     init_pomodoro_screen(scr);
@@ -1609,6 +1738,7 @@ static void ble_reset_click_cb(lv_event_t* e) {
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     if (history_container) lv_obj_add_flag(history_container, LV_OBJ_FLAG_HIDDEN);
+    if (vacation_container) lv_obj_add_flag(vacation_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(spotify_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(calendar_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(pomodoro_container, LV_OBJ_FLAG_HIDDEN);
@@ -1622,6 +1752,7 @@ void ui_show_screen(screen_t screen) {
     case SCREEN_SPLASH:     splash_show(); break;
     case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_HISTORY:    if (history_container) { lv_obj_clear_flag(history_container, LV_OBJ_FLAG_HIDDEN); render_history_graph(); } break;
+    case SCREEN_VACATION:   if (vacation_container) lv_obj_clear_flag(vacation_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_SPOTIFY:    lv_obj_clear_flag(spotify_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_CALENDAR:   lv_obj_clear_flag(calendar_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_POMODORO:   lv_obj_clear_flag(pomodoro_container, LV_OBJ_FLAG_HIDDEN); ui_refresh_pomodoro(); break;
@@ -1650,7 +1781,8 @@ void ui_cycle_screen(void) {
     screen_t next;
     switch (current_screen) {
     case SCREEN_USAGE:     next = SCREEN_HISTORY;   break;
-    case SCREEN_HISTORY:   next = SCREEN_SPOTIFY;   break;
+    case SCREEN_HISTORY:   next = SCREEN_VACATION;  break;
+    case SCREEN_VACATION:  next = SCREEN_SPOTIFY;   break;
     case SCREEN_SPOTIFY:   next = SCREEN_CALENDAR;  break;
     case SCREEN_CALENDAR:  next = SCREEN_POMODORO;  break;
     case SCREEN_POMODORO:  next = SCREEN_PHOTO;     break;
@@ -1668,7 +1800,8 @@ void ui_cycle_screen_auto(void) {
     screen_t next;
     switch (current_screen) {
     case SCREEN_USAGE:     next = SCREEN_HISTORY; break;
-    case SCREEN_HISTORY:   next = SCREEN_SPOTIFY; break;
+    case SCREEN_HISTORY:   next = SCREEN_VACATION; break;
+    case SCREEN_VACATION:  next = SCREEN_SPOTIFY; break;
     case SCREEN_SPOTIFY:   next = SCREEN_CALENDAR; break;
     case SCREEN_CALENDAR:  next = SCREEN_POMODORO; break;
     case SCREEN_POMODORO:  next = SCREEN_PHOTO;    break;

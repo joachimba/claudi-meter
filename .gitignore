@@ -22,3 +22,6 @@ __pycache__/
 # Simulator build + vendored lvgl
 sim/build/
 sim/lvgl/
+
+# SwiftBar plugin dir (machine-specific symlink)
+app/

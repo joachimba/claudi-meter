@@ -41,6 +41,14 @@ struct HistoryData {
     bool     cost_valid;   // true once a cost ("ck") payload has arrived
 };
 
+struct VacationData {
+    char destination[64];   // "Tokyo, Japan"
+    char date_label[40];    // preformatted, e.g. "1 Sep 2026"
+    int  days;              // days until trip start; 0 = today, <0 = under way
+    bool active;            // false when no trip is configured
+    bool valid;
+};
+
 #define BT_ACC_MAX 6
 struct BTAccessory {
     char name[40];
