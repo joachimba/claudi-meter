@@ -86,6 +86,18 @@ VACATION_FILE = CONFIG_DIR / "vacation.json"       # {"destination": "...", "dat
 UNSPLASH_KEY_FILE = CONFIG_DIR / "unsplash-key"    # one line: the access key (or $UNSPLASH_ACCESS_KEY)
 VACATION_INTERVAL_S = 60     # re-evaluate the countdown at most this often
 UNSPLASH_SEARCH = "https://api.unsplash.com/search/photos"
+# Bias the backdrop toward places, not portraits/wildlife.
+UNSPLASH_BIAS = "cityscape landscape scenery architecture skyline"
+UNSPLASH_REJECT = (
+    "people", "person", "portrait", "human", "man", "woman", "women", "men",
+    "boy", "girl", "child", "kid", "face", "crowd", "selfie", "model",
+    "animal", "wildlife", "dog", "cat", "pet", "bird", "horse", "lion",
+)
+UNSPLASH_PREFER = (
+    "city", "cityscape", "skyline", "architecture", "building", "landscape",
+    "nature", "mountain", "scenery", "street", "aerial", "landmark", "coast",
+    "skyscraper", "temple", "sea", "beach", "sunset", "travel",
+)
 
 CONNECT_TIMEOUT = 20.0   # bound client.connect(); a half-open link must not hang forever
 BLE_WRITE_TIMEOUT = 10.0  # bound every GATT write; a stuck write -> teardown + reconnect
@@ -845,13 +857,39 @@ def load_vacation() -> dict | None:
     }
 
 
+def _photo_text(photo: dict) -> str:
+    """Lowercase blob of a photo's tags + descriptions, for keyword matching."""
+    parts = [photo.get("description") or "", photo.get("alt_description") or ""]
+    for t in (photo.get("tags") or []):
+        if isinstance(t, dict):
+            parts.append(t.get("title") or "")
+    return " ".join(parts).lower()
+
+
+def _pick_place_photo(results: list) -> dict | None:
+    """Prefer landscape/city photos; skip anything tagged people or animals.
+    Falls back to the top relevance result if everything gets filtered."""
+    scored = []
+    for p in results:
+        txt = _photo_text(p)
+        reject = any(w in txt for w in UNSPLASH_REJECT)
+        prefer = any(w in txt for w in UNSPLASH_PREFER)
+        scored.append((p, reject, prefer))
+    clean = [p for (p, rej, _) in scored if not rej]
+    if clean:
+        preferred = [p for (p, rej, pref) in scored if not rej and pref]
+        return preferred[0] if preferred else clean[0]
+    return results[0] if results else None   # fallback: nothing passed
+
+
 async def _unsplash_image_url(query: str, key: str) -> str | None:
-    """Resolve a square destination photo URL via the Unsplash search API,
-    honouring the download-tracking guideline."""
+    """Resolve a square place photo URL via the Unsplash search API, biased
+    toward landscapes/cityscapes and away from people/animals. Honours the
+    download-tracking guideline."""
     headers = {"Authorization": f"Client-ID {key}",
                "Accept-Version": "v1"}
-    params = {"query": query, "orientation": "squarish",
-              "per_page": "1", "content_filter": "high"}
+    params = {"query": f"{query} {UNSPLASH_BIAS}", "orientation": "squarish",
+              "per_page": "24", "content_filter": "high"}
     try:
         async with httpx.AsyncClient(timeout=15.0) as http:
             r = await http.get(UNSPLASH_SEARCH, headers=headers, params=params)
@@ -862,7 +900,9 @@ async def _unsplash_image_url(query: str, key: str) -> str | None:
             if not results:
                 log(f"Unsplash: no photo for {query!r}")
                 return None
-            photo = results[0]
+            photo = _pick_place_photo(results)
+            if photo is None:
+                return None
             # Attribution guideline: ping the download endpoint (fire-and-forget).
             dl = (photo.get("links") or {}).get("download_location")
             if dl:
