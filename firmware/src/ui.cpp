@@ -131,14 +131,18 @@ static lv_obj_t* history_canvas    = nullptr;
 static uint16_t* history_buf       = nullptr;
 static HistoryData history_data    = {};        // last payload, kept for redraw
 
-// ---- Vacation countdown screen (Polarsteps-style: photo + big countdown) ----
+// ---- Vacation countdown screen (Polarsteps-style: photo + flip-clock tiles) ----
+#define VAC_TILE_MAX 3          // up to 3 digits (e.g. 365)
+#define VAC_TILE_W   74
+#define VAC_TILE_H   98
 static lv_obj_t* vacation_container = nullptr;
 static lv_obj_t* vac_canvas        = nullptr;   // full-screen backdrop (BLE vacimg buffer)
-static lv_obj_t* vac_scrim         = nullptr;   // translucent panel behind the text
-static lv_obj_t* lbl_vac_days      = nullptr;   // big number ("36" / "TODAY")
-static lv_obj_t* lbl_vac_caption   = nullptr;   // "DAYS UNTIL" / "DAY UNTIL"
+static lv_obj_t* vac_overlay       = nullptr;   // full-screen dark tint for legibility
+static lv_obj_t* vac_tiles         = nullptr;   // centered row of digit cards
+static lv_obj_t* vac_tile[VAC_TILE_MAX]     = {nullptr};
+static lv_obj_t* vac_tile_lbl[VAC_TILE_MAX] = {nullptr};
+static lv_obj_t* lbl_vac_caption   = nullptr;   // "nights until"
 static lv_obj_t* lbl_vac_dest      = nullptr;   // destination name
-static lv_obj_t* lbl_vac_date      = nullptr;   // date label
 static lv_obj_t* lbl_vac_empty     = nullptr;   // "No trip set" placeholder
 static bool      vac_have_image    = false;
 
@@ -627,46 +631,82 @@ static void init_vacation_screen(lv_obj_t* scr) {
     lv_obj_set_style_border_width(vac_canvas, 0, 0);
     lv_obj_clear_flag(vac_canvas, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Bottom scrim so the countdown text stays legible over any photo.
-    vac_scrim = lv_obj_create(vacation_container);
-    lv_obj_set_size(vac_scrim, SCR_W, 210);
-    lv_obj_set_pos(vac_scrim, 0, SCR_H - 210);
-    lv_obj_set_style_bg_color(vac_scrim, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(vac_scrim, LV_OPA_60, 0);
-    lv_obj_set_style_border_width(vac_scrim, 0, 0);
-    lv_obj_set_style_radius(vac_scrim, 0, 0);
-    lv_obj_clear_flag(vac_scrim, LV_OBJ_FLAG_SCROLLABLE);
+    // Whole-photo dark tint so white text reads anywhere over it.
+    vac_overlay = lv_obj_create(vacation_container);
+    lv_obj_set_size(vac_overlay, SCR_W, SCR_H);
+    lv_obj_set_pos(vac_overlay, 0, 0);
+    lv_obj_set_style_bg_color(vac_overlay, lv_color_hex(0x0a1420), 0);
+    lv_obj_set_style_bg_opa(vac_overlay, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(vac_overlay, 0, 0);
+    lv_obj_set_style_radius(vac_overlay, 0, 0);
+    lv_obj_clear_flag(vac_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
-    // "DAYS UNTIL" caption.
+    // Row of flip-clock digit cards, centered.
+    const int tiles_y = 150;
+    vac_tiles = lv_obj_create(vacation_container);
+    lv_obj_set_size(vac_tiles, SCR_W, VAC_TILE_H);
+    lv_obj_set_pos(vac_tiles, 0, tiles_y);
+    lv_obj_set_style_bg_opa(vac_tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(vac_tiles, 0, 0);
+    lv_obj_set_style_pad_all(vac_tiles, 0, 0);
+    lv_obj_set_style_pad_column(vac_tiles, 12, 0);
+    lv_obj_clear_flag(vac_tiles, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(vac_tiles, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(vac_tiles, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    for (int i = 0; i < VAC_TILE_MAX; i++) {
+        lv_obj_t* t = lv_obj_create(vac_tiles);
+        lv_obj_set_size(t, VAC_TILE_W, VAC_TILE_H);
+        lv_obj_set_style_bg_color(t, lv_color_hex(0xffffff), 0);
+        lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(t, 12, 0);
+        lv_obj_set_style_border_width(t, 0, 0);
+        lv_obj_set_style_pad_all(t, 0, 0);
+        lv_obj_set_style_shadow_width(t, 12, 0);
+        lv_obj_set_style_shadow_opa(t, LV_OPA_40, 0);
+        lv_obj_set_style_shadow_color(t, lv_color_hex(0x000000), 0);
+        lv_obj_clear_flag(t, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* d = lv_label_create(t);
+        lv_label_set_text(d, "0");
+        lv_obj_set_style_text_font(d, &font_styrene_48, 0);
+        lv_obj_set_style_text_color(d, lv_color_hex(0x14181f), 0);
+        lv_obj_center(d);
+
+        // Split-flap seam across the middle of the card.
+        lv_obj_t* seam = lv_obj_create(t);
+        lv_obj_set_size(seam, VAC_TILE_W, 2);
+        lv_obj_set_style_bg_color(seam, lv_color_hex(0xc9ccd2), 0);
+        lv_obj_set_style_bg_opa(seam, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(seam, 0, 0);
+        lv_obj_set_style_radius(seam, 0, 0);
+        lv_obj_clear_flag(seam, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_center(seam);
+
+        vac_tile[i] = t;
+        vac_tile_lbl[i] = d;
+    }
+
+    // "nights until" caption, centered under the cards.
     lbl_vac_caption = lv_label_create(vacation_container);
-    lv_label_set_text(lbl_vac_caption, "");
-    lv_obj_set_style_text_font(lbl_vac_caption, &font_styrene_20, 0);
-    lv_obj_set_style_text_color(lbl_vac_caption, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_letter_space(lbl_vac_caption, 3, 0);
-    lv_obj_set_pos(lbl_vac_caption, MARGIN + 4, SCR_H - 188);
+    lv_label_set_text(lbl_vac_caption, "nights until");
+    lv_obj_set_style_text_font(lbl_vac_caption, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_vac_caption, lv_color_hex(0xd7dbe0), 0);
+    lv_obj_set_style_text_letter_space(lbl_vac_caption, 2, 0);
+    lv_obj_set_style_text_align(lbl_vac_caption, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(lbl_vac_caption, SCR_W);
+    lv_obj_set_pos(lbl_vac_caption, 0, tiles_y + VAC_TILE_H + 14);
 
-    // Big countdown number.
-    lbl_vac_days = lv_label_create(vacation_container);
-    lv_label_set_text(lbl_vac_days, "--");
-    lv_obj_set_style_text_font(lbl_vac_days, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(lbl_vac_days, lv_color_hex(0xffffff), 0);
-    lv_obj_set_pos(lbl_vac_days, MARGIN, SCR_H - 162);
-
-    // Destination.
+    // Destination, centered under the caption.
     lbl_vac_dest = lv_label_create(vacation_container);
     lv_label_set_text(lbl_vac_dest, "");
     lv_obj_set_style_text_font(lbl_vac_dest, &font_styrene_28, 0);
     lv_obj_set_style_text_color(lbl_vac_dest, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_align(lbl_vac_dest, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(lbl_vac_dest, LV_LABEL_LONG_DOT);
     lv_obj_set_width(lbl_vac_dest, CONTENT_W);
-    lv_obj_set_pos(lbl_vac_dest, MARGIN, SCR_H - 84);
-
-    // Date.
-    lbl_vac_date = lv_label_create(vacation_container);
-    lv_label_set_text(lbl_vac_date, "");
-    lv_obj_set_style_text_font(lbl_vac_date, &font_styrene_24, 0);
-    lv_obj_set_style_text_color(lbl_vac_date, COL_DIM, 0);
-    lv_obj_set_pos(lbl_vac_date, MARGIN, SCR_H - 48);
+    lv_obj_set_pos(lbl_vac_dest, MARGIN, tiles_y + VAC_TILE_H + 48);
 
     // Placeholder shown when no trip is configured.
     lbl_vac_empty = lv_label_create(vacation_container);
@@ -680,10 +720,9 @@ static void init_vacation_screen(lv_obj_t* scr) {
     lv_obj_add_flag(vacation_container, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Toggle the text/scrim widgets vs the "no trip" placeholder.
+// Toggle the countdown widgets vs the "no trip" placeholder.
 static void vac_show_countdown(bool on) {
-    lv_obj_t* group[] = {vac_scrim, lbl_vac_caption, lbl_vac_days,
-                         lbl_vac_dest, lbl_vac_date};
+    lv_obj_t* group[] = {vac_tiles, lbl_vac_caption, lbl_vac_dest};
     for (lv_obj_t* o : group) {
         if (!o) continue;
         if (on) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
@@ -696,7 +735,7 @@ static void vac_show_countdown(bool on) {
 }
 
 void ui_update_vacation(const VacationData* data) {
-    if (!data || !data->valid || !lbl_vac_days) return;
+    if (!data || !data->valid || !vac_tiles) return;
 
     if (!data->active) {
         vac_show_countdown(false);
@@ -704,16 +743,33 @@ void ui_update_vacation(const VacationData* data) {
     }
     vac_show_countdown(true);
 
-    char num[16];
+    // Number shown in the cards (clamped 0..999) and its caption.
+    int disp = data->days;
     const char* cap;
-    if (data->days > 1)       { snprintf(num, sizeof(num), "%d", data->days); cap = "DAYS UNTIL"; }
-    else if (data->days == 1) { snprintf(num, sizeof(num), "1");              cap = "DAY UNTIL"; }
-    else if (data->days == 0) { snprintf(num, sizeof(num), "TODAY");          cap = "DEPARTURE DAY"; }
-    else                      { snprintf(num, sizeof(num), "DAY %d", -data->days + 1); cap = "UNDER WAY"; }
+    if (data->days > 1)       cap = "nights until";
+    else if (data->days == 1) cap = "night until";
+    else if (data->days == 0) { cap = "departure day"; disp = 0; }
+    else                      { cap = "under way";     disp = 0; }
+    if (disp < 0)   disp = 0;
+    if (disp > 999) disp = 999;
+
+    char num[8];
+    snprintf(num, sizeof(num), "%d", disp);
+    int len = (int)strlen(num);
+
+    // One card per digit, centered; hide unused cards (flex skips them).
+    for (int i = 0; i < VAC_TILE_MAX; i++) {
+        if (i < len) {
+            char c[2] = { num[i], '\0' };
+            lv_label_set_text(vac_tile_lbl[i], c);
+            lv_obj_clear_flag(vac_tile[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(vac_tile[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     lv_label_set_text(lbl_vac_caption, cap);
-    lv_label_set_text(lbl_vac_days, num);
     lv_label_set_text(lbl_vac_dest, data->destination);
-    lv_label_set_text(lbl_vac_date, data->date_label);
 }
 
 void ui_update_vacation_image(const uint8_t* rgb565) {
