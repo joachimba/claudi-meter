@@ -447,23 +447,39 @@ void loop() {
         bool back_now = (digitalRead(BTN_BACK) == LOW);
         bool fwd_now  = (digitalRead(BTN_FWD)  == LOW);
 
+        // While the AFK overlay is up the first press only dismisses it — the
+        // user is obviously here, and swallowing the press keeps a stray Space
+        // out of whatever has focus on the host.
         if (back_now != back_was) {
-            if (back_now) ble_keyboard_press(0x2C, 0);  // HID Space, no mods
-            else          ble_keyboard_release();
             back_was = back_now;
             oled_protect_note_activity();
+            if (back_now) {
+                if (ui_afk_active()) ui_afk_dismiss();
+                else                 ble_keyboard_press(0x2C, 0);  // HID Space, no mods
+            } else {
+                ble_keyboard_release();
+            }
         }
         if (fwd_now != fwd_was) {
-            if (fwd_now) ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
-            else         ble_keyboard_release();
             fwd_was = fwd_now;
             oled_protect_note_activity();
+            if (fwd_now) {
+                if (ui_afk_active()) ui_afk_dismiss();
+                else                 ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
+            } else {
+                ble_keyboard_release();
+            }
         }
 
         if (power_pwr_pressed()) {
-            if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
-            else                                          ui_cycle_screen();
             oled_protect_note_activity();
+            if (ui_afk_active()) {
+                ui_afk_dismiss();
+            } else if (ui_get_current_screen() == SCREEN_SPLASH) {
+                splash_next();
+            } else {
+                ui_cycle_screen();
+            }
         }
         if (touch_pressed) oled_protect_note_activity();
     }
@@ -519,7 +535,10 @@ void loop() {
     static uint32_t last_json_ms = 0;
     {
         const uint32_t STALE_MS = 120UL * 1000UL;
-        if (last_json_ms != 0 && (millis() - last_json_ms) > STALE_MS) {
+        // ui_afk_suppressed(): the user manually dismissed the overlay, so
+        // don't slam it back up every loop while the daemon is still missing.
+        if (last_json_ms != 0 && (millis() - last_json_ms) > STALE_MS &&
+                !ui_afk_suppressed()) {
             ui_set_afk(true);
         }
     }

@@ -29,6 +29,11 @@ from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
 DEVICE_NAME = "Claude Controller"
+# macOS reports the *bonded* peer's cached/user-edited name, not the name in the
+# advertisement, so a device renamed in Bluetooth Settings stops matching
+# DEVICE_NAME exactly. Any of these count as ours; a hit on SERVICE_UUID counts
+# regardless of name.
+DEVICE_NAMES = {DEVICE_NAME, "Clawdmeter", "Claudi Meter"}
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
@@ -461,8 +466,8 @@ def get_bt_accessories() -> list:
 
     accessories = []
     for name, props in items:
-        if name == "Claude Controller":
-            continue
+        if name in DEVICE_NAMES:
+            continue  # don't list ourselves as an accessory
         main = props.get("device_batteryLevelMain")
         left = props.get("device_batteryLevelLeft")
         right = props.get("device_batteryLevelRight")
@@ -688,7 +693,9 @@ async def scan_for_device() -> str | None:
                 ident = str(p.identifier().UUIDString())
                 name = p.name() or ""
                 log(f"  connected-peripheral: {ident}  name={name!r}")
-                if name == DEVICE_NAME or not name:
+                # A hit on our custom 128-bit service is proof enough — nothing
+                # else on the machine exposes it, whatever macOS calls it.
+                if svc_str == SERVICE_UUID or name in DEVICE_NAMES or not name:
                     log(f"Found via connected list: {ident}")
                     return ident
     except Exception as e:
@@ -705,9 +712,13 @@ async def scan_for_device() -> str | None:
             )
             for d in filtered:
                 log(f"  filtered: {d.address!s:40s} name={d.name!r}")
+            # Our custom service UUID is unique to this firmware, so any device
+            # that answers that filter is the one we want regardless of the name
+            # macOS has cached for it. The HID (0x1812) filter is NOT unique, so
+            # there we still require a known name.
             for d in filtered:
-                if d.name == DEVICE_NAME:
-                    log(f"Found via filtered scan: {d.address}")
+                if svc_uuid == SERVICE_UUID or d.name in DEVICE_NAMES:
+                    log(f"Found via filtered scan: {d.address} (name={d.name!r})")
                     return d.address
         except Exception as e:
             log(f"Filtered scan unavailable: {e}")
@@ -718,8 +729,8 @@ async def scan_for_device() -> str | None:
     for d in devices:
         log(f"  saw: {d.address!s:40s} name={d.name!r}")
     for d in devices:
-        if d.name == DEVICE_NAME:
-            log(f"Found: {d.address}")
+        if d.name in DEVICE_NAMES:
+            log(f"Found: {d.address} (name={d.name!r})")
             return d.address
     return None
 
@@ -1362,6 +1373,13 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
         await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT)
     except (BleakError, asyncio.TimeoutError) as e:
         log(f"Connection failed: {e}")
+        # CBErrorDomain 14 = the peer no longer has the bond this Mac still
+        # holds (ESP NVS wiped, bonds cleared on-device, or a fresh chip).
+        # Rescanning can't fix it — the stale macOS pairing has to go.
+        if "removed pairing information" in str(e):
+            log("Bond mismatch: this Mac has a pairing the device no longer has. "
+                "Fix: System Settings -> Bluetooth -> forget the device "
+                "(shown as 'Clawdmeter'), then let it re-pair.")
         return False
 
     if not client.is_connected:
@@ -1402,11 +1420,11 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
             # outer loop reconnect from a clean slate.
             gap = now - last_tick_at
             if last_tick_at > 0 and gap > TICK * 5:
+                # Keep the cached address: the CoreBluetooth peer UUID survives
+                # sleep, and dropping it forces a full rescan — the slow, fragile
+                # path. The 3-consecutive-failure rule in main() still
+                # invalidates it if the peer really is gone.
                 log(f"Sleep/wake gap={gap:.0f}s — tearing down BLE client")
-                try:
-                    SAVED_ADDR_FILE.unlink(missing_ok=True)
-                except OSError:
-                    pass
                 break
             last_tick_at = now
             elapsed = now - last_poll

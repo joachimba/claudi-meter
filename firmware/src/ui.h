@@ -29,6 +29,9 @@ void ui_update_history(const HistoryData* data);
 void ui_update_vacation(const VacationData* data);
 void ui_update_vacation_image(const uint8_t* rgb565);
 void ui_set_afk(bool on);
+bool ui_afk_active(void);         // overlay currently covering the screen?
+void ui_afk_dismiss(void);        // local escape: hide it and mute the stale-data watchdog
+bool ui_afk_suppressed(void);     // true while a manual dismiss is still holding it off
 void ui_set_attention(bool on);   // bounce the top-left Clawd logo when Claude Code needs you
 void ui_refresh_settings(void);   // sync Settings screen widgets to settings.cpp state
 void ui_tick_anim(void);

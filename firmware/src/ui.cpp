@@ -158,6 +158,11 @@ static int8_t    afk_anim_idx = -1;
 static uint16_t  afk_anim_frame = 0;
 static uint32_t  afk_anim_last_ms = 0;
 static bool      afk_is_on = false;
+// Manual escape hatch: a tap or button press hides the overlay and mutes the
+// firmware-side stale-data watchdog for a while, so a daemon that can't
+// reconnect (dead BLE link, unpaired host) can't trap the UI behind it.
+static uint32_t  afk_dismissed_ms = 0;
+#define AFK_SUPPRESS_MS (10UL * 60UL * 1000UL)
 
 // ---- Bluetooth screen widgets ----
 static lv_obj_t* ble_container;
@@ -1382,6 +1387,11 @@ static void render_afk_anim_frame(const splash_anim_def_t* a, int frame) {
     if (afk_canvas) lv_obj_invalidate(afk_canvas);
 }
 
+static void afk_click_cb(lv_event_t* e) {
+    (void)e;
+    ui_afk_dismiss();
+}
+
 static void init_afk_overlay(lv_obj_t* scr) {
     afk_layer = lv_obj_create(scr);
     lv_obj_set_size(afk_layer, SCR_W, SCR_H);
@@ -1391,6 +1401,10 @@ static void init_afk_overlay(lv_obj_t* scr) {
     lv_obj_set_style_border_width(afk_layer, 0, 0);
     lv_obj_set_style_pad_all(afk_layer, 0, 0);
     lv_obj_clear_flag(afk_layer, LV_OBJ_FLAG_SCROLLABLE);
+    // Own click handler so a tap dismisses the overlay instead of falling
+    // through to whatever screen is hidden underneath it.
+    lv_obj_add_flag(afk_layer, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(afk_layer, afk_click_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* title = lv_label_create(afk_layer);
     lv_label_set_text(title, "Looks like I'm gone");
@@ -1671,6 +1685,19 @@ void ui_set_afk(bool on) {
     } else {
         lv_obj_add_flag(afk_layer, LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+bool ui_afk_active(void) { return afk_is_on; }
+
+void ui_afk_dismiss(void) {
+    afk_dismissed_ms = millis();
+    if (afk_dismissed_ms == 0) afk_dismissed_ms = 1;  // 0 means "never dismissed"
+    ui_set_afk(false);
+}
+
+bool ui_afk_suppressed(void) {
+    if (afk_dismissed_ms == 0) return false;
+    return (millis() - afk_dismissed_ms) < AFK_SUPPRESS_MS;
 }
 
 void ui_update_photo_image(const uint8_t* rgb565) {
