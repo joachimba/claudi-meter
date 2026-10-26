@@ -210,7 +210,8 @@ class VacimgCallbacks : public NimBLECharacteristicCallbacks {
         size_t payload_len = len - VACIMG_HDR_SIZE;
 
         if (total != BLE_VACIMG_BYTES) return;
-        if (offset + payload_len > BLE_VACIMG_BYTES) return;
+        // Written so it can't wrap: offset is attacker-controlled 32-bit.
+        if (offset > BLE_VACIMG_BYTES || payload_len > BLE_VACIMG_BYTES - offset) return;
 
         if (hash != vacimg_active_hash || offset == 0) {
             vacimg_active_hash = hash;
