@@ -19,6 +19,7 @@ import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 import zlib
 from datetime import datetime, timedelta
@@ -39,16 +40,13 @@ RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 IMG_CHAR_UUID   = "4c41555a-4465-7669-6365-000000000005"
 CMD_CHAR_UUID   = "4c41555a-4465-7669-6365-000000000006"
-PHOTO_CHAR_UUID = "4c41555a-4465-7669-6365-000000000007"
 VACIMG_CHAR_UUID = "4c41555a-4465-7669-6365-000000000008"
 
-# Ambient photo screen sizing + cadence.
-PHOTO_W = 480
-PHOTO_H = 480
-PHOTO_BYTES = PHOTO_W * PHOTO_H * 2
-PHOTO_CHUNK_PAYLOAD = 226       # MTU(247) - ATT(3) - photo header(10) margin
-PHOTO_CHANGE_INTERVAL_S = 90    # rotate to a new photo every 90 s
-PHOTO_LIST_URL = "https://chromecastbg.alexmeub.com/images.v9.json"
+# Full-screen vacation backdrop sizing.
+BACKDROP_W = 480
+BACKDROP_H = 480
+BACKDROP_BYTES = BACKDROP_W * BACKDROP_H * 2
+BACKDROP_CHUNK_PAYLOAD = 226    # MTU(247) - ATT(3) - backdrop header(10) margin
 
 AFK_IDLE_THRESHOLD_S = 180     # 3 min of no input → user is gone
 IDLE_TIME_RE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')
@@ -90,6 +88,8 @@ CONFIG_DIR = Path.home() / ".config" / "claude-usage-monitor"
 VACATION_FILE = CONFIG_DIR / "vacation.json"       # {"destination": "...", "date": "YYYY-MM-DD"}
 UNSPLASH_KEY_FILE = CONFIG_DIR / "unsplash-key"    # one line: the access key (or $UNSPLASH_ACCESS_KEY)
 VACATION_INTERVAL_S = 60     # re-evaluate the countdown at most this often
+VACATION_TRIP_DAYS = 14      # vacation.json only has a departure date; show
+                             # "under way" this long after it, then "no trip"
 UNSPLASH_SEARCH = "https://api.unsplash.com/search/photos"
 # Bias the backdrop toward places, not portraits/wildlife — applied by
 # filtering the result set (not by narrowing the search query). Matched at
@@ -121,6 +121,9 @@ UNSPLASH_PREFER = frozenset((
 CONNECT_TIMEOUT = 20.0   # bound client.connect(); a half-open link must not hang forever
 BLE_WRITE_TIMEOUT = 10.0  # bound every GATT write; a stuck write -> teardown + reconnect
 WATCHDOG_STALL_S = 45.0   # no main-loop progress this long -> force disconnect (unwedge)
+DISCONNECT_TIMEOUT = 5.0  # bound client.disconnect(); bleak waits on a CB callback that may never fire
+SLEEP_GAP_S = 10.0        # wall clock outran awake time by this much -> host slept
+LIVENESS_STALL_S = 300.0  # no heartbeat for this much awake time -> exit, launchd restarts us
 
 # --- Daily token-usage history (for the firmware graph screen) ---
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -133,6 +136,16 @@ TOKEN_UNIT = 100_000       # graph values sent in units of 100k tokens (fits uin
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
+# Peers that answered with CBError 14 ("Peer removed pairing information").
+# macOS keeps a *second* CoreBluetooth identity for a device whose bond the
+# peer has since dropped, and that ghost keeps showing up in scans forever
+# alongside the live one. Persisted so a daemon restart doesn't relearn it.
+BAD_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "bad-addresses"
+# Last peer that actually delivered data. Unlike ble-address (a scan result,
+# discarded on failure) this is only written after a working session and is
+# never deleted, so a nearby look-alike board can't permanently displace the
+# real one in the scan results.
+LAST_GOOD_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "last-good-address"
 
 SPOTIFY_SCRIPT = '''
 tell application "System Events"
@@ -183,6 +196,47 @@ API_BODY = {
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def awake_clock() -> float:
+    """Seconds of host uptime that excludes time spent asleep. Paired with
+    time.time() (which does advance across sleep) to tell a real sleep apart
+    from a loop iteration that was merely slow."""
+    if hasattr(time, "CLOCK_UPTIME_RAW"):  # macOS: stops while asleep
+        return time.clock_gettime(time.CLOCK_UPTIME_RAW)
+    return time.monotonic()  # Linux CLOCK_MONOTONIC also stops in suspend
+
+
+_last_heartbeat = awake_clock()
+
+
+def heartbeat() -> None:
+    global _last_heartbeat
+    _last_heartbeat = awake_clock()
+
+
+def start_liveness_watchdog() -> None:
+    """Last line of defence against hangs nobody has found yet. Runs on its own
+    thread so it still fires when the event loop is wedged (a blocking call) or
+    idle on a future that never resolves (an unbounded await). Exits non-zero
+    so launchd's KeepAlive restarts the daemon from a clean slate. Measured in
+    awake time, so a night of host sleep doesn't count as a stall."""
+    def _run() -> None:
+        while True:
+            time.sleep(15)
+            stall = awake_clock() - _last_heartbeat
+            if stall > LIVENESS_STALL_S:
+                log(f"Liveness watchdog: no progress for {stall:.0f}s — exiting for restart")
+                os._exit(1)
+
+    threading.Thread(target=_run, name="liveness-watchdog", daemon=True).start()
+
+
+async def safe_disconnect(client: BleakClient) -> None:
+    try:
+        await asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_TIMEOUT)
+    except (BleakError, asyncio.TimeoutError):
+        pass
 
 
 def _extract_access_token(blob: str) -> str | None:
@@ -418,84 +472,6 @@ def get_calendar() -> dict | None:
     return {"title": title, "mins_until": mins_until}
 
 
-def get_bt_accessories() -> list:
-    """Return up to 6 connected Bluetooth accessories with battery info.
-
-    Pulls from `system_profiler SPBluetoothDataType -json`. We only surface
-    devices that actually expose a battery level — skips the dashboard's own
-    "Claude Controller" and accessories without a battery field. Each entry
-    is {"n": name, "b": pct (-1=unknown), "c": charging-bool}.
-    """
-    if sys.platform != "darwin":
-        return []
-    try:
-        out = subprocess.run(
-            ["system_profiler", "SPBluetoothDataType", "-json"],
-            capture_output=True, text=True, timeout=6,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
-    try:
-        data = json.loads(out.stdout)
-    except json.JSONDecodeError:
-        return []
-
-    items = []
-    def walk(node):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                if k == "device_connected" and isinstance(v, list):
-                    for ent in v:
-                        if isinstance(ent, dict):
-                            for name, props in ent.items():
-                                if isinstance(props, dict):
-                                    items.append((name, props))
-                else:
-                    walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-
-    walk(data)
-
-    def parse_pct(s):
-        if not s:
-            return -1
-        m = re.search(r"(\d+)", str(s))
-        return int(m.group(1)) if m else -1
-
-    accessories = []
-    for name, props in items:
-        if name in DEVICE_NAMES:
-            continue  # don't list ourselves as an accessory
-        main = props.get("device_batteryLevelMain")
-        left = props.get("device_batteryLevelLeft")
-        right = props.get("device_batteryLevelRight")
-        case_pct = props.get("device_batteryLevelCase")
-        pct = parse_pct(main)
-        if pct < 0:
-            # Average left + right for AirPods-style devices.
-            l = parse_pct(left)
-            r = parse_pct(right)
-            if l >= 0 and r >= 0:
-                pct = (l + r) // 2
-            elif l >= 0:
-                pct = l
-            elif r >= 0:
-                pct = r
-        charging = (str(props.get("device_isCharging") or "").lower() == "yes")
-        if pct < 0 and parse_pct(case_pct) < 0:
-            continue   # nothing to show
-        accessories.append({
-            "n": name[:30],
-            "b": pct,
-            "c": charging,
-        })
-        if len(accessories) >= 6:
-            break
-    return accessories
-
-
 def macos_idle_seconds() -> int:
     """Seconds since the last HID input (mouse / keyboard) via IORegistry.
     Returns 0 if the platform isn't macOS or `ioreg` is unavailable."""
@@ -563,43 +539,42 @@ def _dominant_rgb(img) -> tuple[int, int, int]:
     return (60, 60, 60)
 
 
-async def _fetch_photo_rgb565(url: str) -> tuple[bytes, int] | None:
-    """Download URL + resize to PHOTO_W×PHOTO_H + pack as RGB565 LE."""
+async def _fetch_backdrop_rgb565(url: str) -> bytes | None:
+    """Download URL + resize to BACKDROP_W×BACKDROP_H + pack as RGB565 LE."""
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
     except ImportError:
-        log("Pillow not installed; ambient photo disabled")
+        log("Pillow not installed; vacation backdrop disabled")
         return None
     try:
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as http:
             r = await http.get(url)
         r.raise_for_status()
     except httpx.HTTPError as e:
-        log(f"Photo fetch failed: {e}")
+        log(f"Backdrop fetch failed: {e}")
         return None
     try:
-        from PIL import ImageOps
         src = Image.open(io.BytesIO(r.content)).convert("RGB")
-        # Object-fit: cover — scale to fill PHOTO_W x PHOTO_H + center-crop.
+        # Object-fit: cover — scale to fill BACKDROP_W x BACKDROP_H + center-crop.
         rgb = ImageOps.fit(
-            src, (PHOTO_W, PHOTO_H),
+            src, (BACKDROP_W, BACKDROP_H),
             method=Image.Resampling.LANCZOS,
             centering=(0.5, 0.5),
         )
     except Exception as e:
-        log(f"Photo decode failed: {e}")
+        log(f"Backdrop decode failed: {e}")
         return None
-    buf = bytearray(PHOTO_BYTES)
+    buf = bytearray(BACKDROP_BYTES)
     px = rgb.load()
     i = 0
-    for y in range(PHOTO_H):
-        for x in range(PHOTO_W):
+    for y in range(BACKDROP_H):
+        for x in range(BACKDROP_W):
             r8, g8, b8 = px[x, y]
             v = ((r8 >> 3) << 11) | ((g8 >> 2) << 5) | (b8 >> 3)
             buf[i] = v & 0xFF
             buf[i + 1] = (v >> 8) & 0xFF
             i += 2
-    return bytes(buf), 0
+    return bytes(buf)
 
 
 async def _fetch_art_rgb565(url: str) -> tuple[bytes, int] | None:
@@ -642,10 +617,49 @@ async def _fetch_art_rgb565(url: str) -> tuple[bytes, int] | None:
     return bytes(buf), dom_int
 
 
+def load_bad_addresses() -> set[str]:
+    try:
+        return {ln.strip().upper() for ln in BAD_ADDR_FILE.read_text().splitlines()
+                if ln.strip()}
+    except OSError:
+        return set()
+
+
+def mark_bad_address(addr: str) -> None:
+    """Remember a peer whose bond is dead so scans stop handing it back."""
+    bad = load_bad_addresses()
+    if addr.upper() in bad:
+        return
+    bad.add(addr.upper())
+    BAD_ADDR_FILE.parent.mkdir(parents=True, exist_ok=True)
+    BAD_ADDR_FILE.write_text("\n".join(sorted(bad)) + "\n")
+    log(f"Blacklisted dead peer {addr}")
+
+
+def load_last_good_address() -> str | None:
+    try:
+        addr = LAST_GOOD_ADDR_FILE.read_text().strip()
+    except OSError:
+        return None
+    return addr or None
+
+
+def save_last_good_address(addr: str) -> None:
+    if load_last_good_address() == addr:
+        return
+    LAST_GOOD_ADDR_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LAST_GOOD_ADDR_FILE.write_text(addr)
+    log(f"Recorded known-good peer {addr}")
+
+
 def load_cached_address() -> str | None:
     if not SAVED_ADDR_FILE.exists():
         return None
     addr = SAVED_ADDR_FILE.read_text().strip()
+    if addr.upper() in load_bad_addresses():
+        log(f"Cached address {addr} is blacklisted, discarding")
+        SAVED_ADDR_FILE.unlink(missing_ok=True)
+        return None
     # Accept both Linux MAC (AA:BB:CC:DD:EE:FF) and macOS CoreBluetooth UUID
     # (E621E1F8-C36C-495A-93FC-0C247A3E6E5F).
     if re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", addr) or re.fullmatch(
@@ -662,6 +676,39 @@ def save_address(addr: str) -> None:
     SAVED_ADDR_FILE.write_text(addr)
 
 
+def _candidate_rank(name: str | None) -> int:
+    """Lower is better. A peer advertising the *firmware's* name is the live
+    device; a peer showing some other cached name is usually a ghost record
+    macOS kept from an old bond (see BAD_ADDR_FILE), so try it last."""
+    if name == DEVICE_NAME:
+        return 0
+    if name in DEVICE_NAMES:
+        return 2
+    return 1  # unnamed but matched on our service UUID
+
+
+def _pick_candidate(cands: list[tuple[str, str | None]], how: str,
+                    skipped: list[tuple[str, str | None]] | None = None) -> str | None:
+    """Drop blacklisted peers, then take the best-ranked survivor. Blacklisted
+    ones are appended to `skipped` so the caller can fall back to them if no
+    strategy turns up anything better."""
+    bad = load_bad_addresses()
+    live: list[tuple[str, str | None]] = []
+    for addr, name in cands:
+        if addr.upper() in bad:
+            log(f"  skipping blacklisted peer {addr} (name={name!r})")
+            if skipped is not None and addr not in [a for a, _ in skipped]:
+                skipped.append((addr, name))
+        else:
+            live.append((addr, name))
+    if not live:
+        return None
+    live.sort(key=lambda an: _candidate_rank(an[1]))
+    addr, name = live[0]
+    log(f"Found via {how}: {addr} (name={name!r})")
+    return addr
+
+
 async def scan_for_device() -> str | None:
     """Find the Clawdmeter peripheral on macOS.
 
@@ -674,21 +721,46 @@ async def scan_for_device() -> str | None:
          This is the path that succeeds once the HID pair is in place.
       2. Fall back to a normal scan — works when the device is advertising
          but no central is holding the connection yet.
+
+    Every strategy collects *all* matches and ranks them rather than taking
+    the first hit: the Mac can surface two identities for one device (the live
+    one plus a ghost of a dropped bond), and scan order between them is
+    arbitrary.
     """
+    # Peers we passed over because they're blacklisted; used as a last-resort
+    # fallback below so a stale blacklist can never lock the daemon out.
+    skipped: list[tuple[str, str | None]] = []
+
     # Strategy 1: connected-peripherals lookup via pyobjc.
     try:
         from CoreBluetooth import CBCentralManager, CBUUID
-        import objc
         log("connected-peripheral lookup starting")
-        cm = CBCentralManager.alloc().initWithDelegate_queue_(None, None)
-        await asyncio.sleep(2.0)  # let CB warm up
-        # Try both our custom data service AND the HID service (which is what
-        # macOS actually paired against, so the OS *definitely* knows the peer
-        # is offering that service).
-        for svc_str in (SERVICE_UUID, "1812"):
+        # Give the manager its own dispatch queue: with queue=None it delivers
+        # on the main queue, which asyncio never services, so it can sit in
+        # .unknown forever and every retrieve returns nothing.
+        try:
+            import libdispatch
+            cb_queue = libdispatch.dispatch_queue_create(b"claudebuddy.cb", None)
+        except Exception as e:
+            log(f"libdispatch unavailable ({e}); falling back to main queue")
+            cb_queue = None
+        cm = CBCentralManager.alloc().initWithDelegate_queue_(None, cb_queue)
+        # Poll for poweredOn (5) rather than sleeping blind — the lookup is
+        # silently empty until the manager is up.
+        for _ in range(60):
+            if cm.state() == 5:
+                break
+            await asyncio.sleep(0.1)
+        log(f"CBCentralManager state={cm.state()} (5=poweredOn)")
+        # Our custom data service plus every standard service the HID profile
+        # publishes (HID, device info, battery) — macOS definitely knows the
+        # bonded keyboard offers those, and a peer it already holds a
+        # connection to is invisible to scans.
+        for svc_str in (SERVICE_UUID, "1812", "180A", "180F"):
             svc_uuid = CBUUID.UUIDWithString_(svc_str)
             peripherals = cm.retrieveConnectedPeripheralsWithServices_([svc_uuid])
             log(f"connected-peripheral lookup (svc={svc_str}): {len(peripherals)} match(es)")
+            cands: list[tuple[str, str | None]] = []
             for p in peripherals:
                 ident = str(p.identifier().UUIDString())
                 name = p.name() or ""
@@ -696,8 +768,10 @@ async def scan_for_device() -> str | None:
                 # A hit on our custom 128-bit service is proof enough — nothing
                 # else on the machine exposes it, whatever macOS calls it.
                 if svc_str == SERVICE_UUID or name in DEVICE_NAMES or not name:
-                    log(f"Found via connected list: {ident}")
-                    return ident
+                    cands.append((ident, name))
+            picked = _pick_candidate(cands, "connected list", skipped)
+            if picked:
+                return picked
     except Exception as e:
         log(f"connected-peripheral lookup unavailable: {e}")
 
@@ -716,10 +790,11 @@ async def scan_for_device() -> str | None:
             # that answers that filter is the one we want regardless of the name
             # macOS has cached for it. The HID (0x1812) filter is NOT unique, so
             # there we still require a known name.
-            for d in filtered:
-                if svc_uuid == SERVICE_UUID or d.name in DEVICE_NAMES:
-                    log(f"Found via filtered scan: {d.address} (name={d.name!r})")
-                    return d.address
+            cands = [(d.address, d.name) for d in filtered
+                     if svc_uuid == SERVICE_UUID or d.name in DEVICE_NAMES]
+            picked = _pick_candidate(cands, "filtered scan", skipped)
+            if picked:
+                return picked
         except Exception as e:
             log(f"Filtered scan unavailable: {e}")
 
@@ -728,10 +803,26 @@ async def scan_for_device() -> str | None:
     devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
     for d in devices:
         log(f"  saw: {d.address!s:40s} name={d.name!r}")
-    for d in devices:
-        if d.name in DEVICE_NAMES:
-            log(f"Found: {d.address} (name={d.name!r})")
-            return d.address
+    picked = _pick_candidate([(d.address, d.name) for d in devices
+                              if d.name in DEVICE_NAMES], "scan", skipped)
+    if picked:
+        return picked
+
+    # Nothing but blacklisted peers anywhere. The blacklist must be stale (the
+    # live device dropped its bond after a reflash, then re-paired under the
+    # same identity), so drop it and retry the best-ranked one.
+    if skipped:
+        if load_last_good_address():
+            # A known-good peer exists, it's just not advertising right now
+            # (macOS hides peripherals it already holds a connection to). Keep
+            # the blacklist and let the caller retry the known-good address.
+            log("Only blacklisted peers found — keeping blacklist, "
+                "known-good peer will be retried")
+            return None
+        log("Only blacklisted peers found — clearing blacklist and retrying")
+        BAD_ADDR_FILE.unlink(missing_ok=True)
+        skipped.sort(key=lambda an: _candidate_rank(an[1]))
+        return skipped[0][0]
     return None
 
 
@@ -851,7 +942,8 @@ def _unsplash_key() -> str | None:
 
 def load_vacation() -> dict | None:
     """Read the vacation config and compute the countdown. Returns None if no
-    trip is configured or the file is malformed.
+    trip is configured, the file is malformed, or the trip is over (departed
+    more than VACATION_TRIP_DAYS ago).
 
     Config: {"destination": "Tokyo, Japan", "date": "2026-09-01",
              "query": "Tokyo skyline" (optional image-search override)}"""
@@ -874,6 +966,8 @@ def load_vacation() -> dict | None:
         log(f"vacation.json: bad date {date_str!r} (want YYYY-MM-DD)")
         return None
     days = (trip - datetime.now().date()).days
+    if days < -VACATION_TRIP_DAYS:
+        return None
     return {
         "destination": dest[:63],
         "days": days,
@@ -1000,15 +1094,9 @@ class Session:
         self.last_spotify_key: str | None = None
         self.last_spotify_playing: bool | None = None
         self.last_calendar_key: str | None = None
-        self.last_photo_hash: int | None = None
-        self.last_photo_change_ms: float = 0.0
-        self.photo_list_cache: list | None = None
-        self.photo_task: asyncio.Task | None = None
         self.last_afk: bool | None = None
         self.attn_active = False
         self.attn_started_at = 0.0
-        self.last_bta_signature: str | None = None
-        self.last_bta_poll_at: float = 0.0
         # Watchdog: bumped whenever the main loop makes progress. If it goes
         # stale the watchdog task force-disconnects to unwedge a hung await.
         self.last_progress: float = time.time()
@@ -1021,6 +1109,7 @@ class Session:
 
     def note_progress(self) -> None:
         self.last_progress = time.time()
+        heartbeat()
 
     async def _ble_write(self, uuid: str, data: bytes, response: bool) -> None:
         """Every GATT write goes through here so a half-open link can't hang
@@ -1054,12 +1143,18 @@ class Session:
 
     async def setup_refresh_subscription(self) -> None:
         try:
-            await self.client.start_notify(REQ_CHAR_UUID, self._on_refresh)
+            await asyncio.wait_for(
+                self.client.start_notify(REQ_CHAR_UUID, self._on_refresh),
+                timeout=BLE_WRITE_TIMEOUT,
+            )
             log("Refresh subscription OK")
         except Exception as e:
             log(f"Refresh subscription unavailable: {type(e).__name__}: {e}")
         try:
-            await self.client.start_notify(CMD_CHAR_UUID, self._on_cmd)
+            await asyncio.wait_for(
+                self.client.start_notify(CMD_CHAR_UUID, self._on_cmd),
+                timeout=BLE_WRITE_TIMEOUT,
+            )
             log("Cmd subscription OK")
         except Exception as e:
             log(f"Cmd subscription unavailable: {type(e).__name__}: {e}")
@@ -1146,40 +1241,24 @@ class Session:
         if not url:
             self.last_vacation_dest = None
             return
-        pkg = await _fetch_photo_rgb565(url)
-        if pkg is None:
+        rgb = await _fetch_backdrop_rgb565(url)
+        if rgb is None:
             self.last_vacation_dest = None
             return
-        rgb, _ = pkg
         h = _url_hash16(url)
         log(f"Sending vacation backdrop for {query!r} ({len(rgb)} bytes)")
         try:
-            for offset in range(0, len(rgb), PHOTO_CHUNK_PAYLOAD):
-                chunk = rgb[offset:offset + PHOTO_CHUNK_PAYLOAD]
+            # Write-with-response so CoreBluetooth/NimBLE both pace properly —
+            # write_no_response on macOS silently drops most chunks, leaving
+            # the ESP-side buffer half-filled.
+            for offset in range(0, len(rgb), BACKDROP_CHUNK_PAYLOAD):
+                chunk = rgb[offset:offset + BACKDROP_CHUNK_PAYLOAD]
                 header = struct.pack("<HII", h, offset, len(rgb))
                 await self._ble_write(VACIMG_CHAR_UUID, header + chunk, response=True)
             log("Vacation backdrop sent")
         except (BleakError, asyncio.TimeoutError) as e:
             log(f"Vacation backdrop send failed: {e}")
             self.last_vacation_dest = None   # retry next cycle
-
-    async def quick_bt_acc_sync(self) -> None:
-        """system_profiler is slow (~1 s), so poll the BT accessory list at
-        most once every 30 s. Push when the list changes, log every poll
-        for now so we can see whether the daemon's launchd context is
-        getting truncated SP output."""
-        now = time.time()
-        if now - self.last_bta_poll_at < 30:
-            return
-        self.last_bta_poll_at = now
-        accessories = get_bt_accessories()
-        log(f"BT acc poll: {len(accessories)} device(s) -> {accessories}")
-        sig = json.dumps(accessories, sort_keys=True, separators=(",", ":"))
-        if sig == self.last_bta_signature:
-            return
-        if await self.write_payload({"bta": accessories}):
-            self.last_bta_signature = sig
-            log(f"BT accessories -> {len(accessories)} device(s) (sent)")
 
     async def quick_attention_sync(self) -> None:
         """Watch for a touch-file written by Claude Code hooks. When seen,
@@ -1255,86 +1334,6 @@ class Session:
         if sp.get("art_url"):
             await self.maybe_send_art(sp["art_url"])
 
-    async def _fetch_photo_list(self) -> list | None:
-        if self.photo_list_cache is not None:
-            return self.photo_list_cache
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as http:
-                r = await http.get(PHOTO_LIST_URL)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            log(f"Photo list fetch failed: {e}")
-            return None
-        if not isinstance(data, list) or not data:
-            return None
-        self.photo_list_cache = data
-        log(f"Photo list cached: {len(data)} entries")
-        return data
-
-    async def maybe_send_photo(self) -> None:
-        """Schedule (non-blocking) a new ambient photo every
-        PHOTO_CHANGE_INTERVAL_S. The actual chunk transfer runs as a
-        background task so spotify / calendar quick-syncs keep flowing
-        through the same BLE link."""
-        now = time.time()
-        if self.photo_task and not self.photo_task.done():
-            return  # transfer already in flight
-        if now - self.last_photo_change_ms < PHOTO_CHANGE_INTERVAL_S:
-            return
-        self.last_photo_change_ms = now   # mark immediately so we don't double-trigger
-        self.photo_task = asyncio.create_task(self._send_photo_task())
-
-    async def _send_photo_task(self) -> None:
-        photos = await self._fetch_photo_list()
-        if not photos:
-            return
-
-        import random
-        entry = None
-        pkg = None
-        for _ in range(5):
-            entry = random.choice(photos)
-            raw_url = entry.get("url") or ""
-            if not raw_url:
-                continue
-            # Rewrite the Google CDN sizing hint so we request something near
-            # 480 px directly — saves bandwidth + resize work.
-            url = re.sub(r"=s\d+-w\d+-h\d+[^?]*", "=s640-w640-h640-c", raw_url)
-            url = re.sub(r"/s\d+/", "/s640/", url)
-            pkg = await _fetch_photo_rgb565(url)
-            if pkg is not None:
-                break
-        if pkg is None or entry is None:
-            return
-        rgb, _ = pkg
-        raw_url = entry.get("url") or ""
-        h = _url_hash16(raw_url)
-        if h == self.last_photo_hash:
-            return
-        photographer = (entry.get("photographer") or "").strip()
-        caption = photographer or "Chromecast Backgrounds"
-
-        log(f"Sending photo (hash=0x{h:04x}, bytes={len(rgb)}, by={photographer!r})")
-        try:
-            # Write-with-response so CoreBluetooth/NimBLE both pace properly —
-            # write_no_response on macOS silently drops most chunks, leaving
-            # the ESP-side buffer half-filled and the canvas stuck on the
-            # "loading" state forever.
-            chunk_idx = 0
-            for offset in range(0, len(rgb), PHOTO_CHUNK_PAYLOAD):
-                chunk = rgb[offset:offset + PHOTO_CHUNK_PAYLOAD]
-                header = struct.pack("<HII", h, offset, len(rgb))
-                await self._ble_write(PHOTO_CHAR_UUID, header + chunk, response=True)
-                chunk_idx += 1
-                if (chunk_idx & 15) == 0:
-                    await asyncio.sleep(0)   # yield to quick-syncs
-            await self.write_payload({"pht": caption[:90]})
-            self.last_photo_hash = h
-            log("Photo sent")
-        except (BleakError, asyncio.TimeoutError) as e:
-            log(f"Photo send failed: {e}")
-
     async def maybe_send_art(self, art_url: str) -> None:
         h = _url_hash16(art_url)
         if h == self.last_art_hash:
@@ -1374,12 +1373,15 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     except (BleakError, asyncio.TimeoutError) as e:
         log(f"Connection failed: {e}")
         # CBErrorDomain 14 = the peer no longer has the bond this Mac still
-        # holds (ESP NVS wiped, bonds cleared on-device, or a fresh chip).
-        # Rescanning can't fix it — the stale macOS pairing has to go.
+        # holds (ESP NVS wiped, bonds cleared on-device, or a fresh chip). The
+        # Mac keeps that identity around and keeps offering it in scans, so
+        # blacklist it and let the next scan pick the live one.
         if "removed pairing information" in str(e):
-            log("Bond mismatch: this Mac has a pairing the device no longer has. "
-                "Fix: System Settings -> Bluetooth -> forget the device "
-                "(shown as 'Clawdmeter'), then let it re-pair.")
+            log("Bond mismatch: this Mac holds a pairing the device no longer "
+                "has. If no other identity for it turns up, forget the device "
+                "in System Settings -> Bluetooth and let it re-pair.")
+            mark_bad_address(address)
+            SAVED_ADDR_FILE.unlink(missing_ok=True)
         return False
 
     if not client.is_connected:
@@ -1400,33 +1402,35 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
             stall = time.time() - session.last_progress
             if stall > WATCHDOG_STALL_S:
                 log(f"Watchdog: loop stalled {stall:.0f}s — forcing disconnect")
-                try:
-                    await client.disconnect()
-                except (BleakError, asyncio.TimeoutError):
-                    pass
+                await safe_disconnect(client)
                 return
 
     watchdog = asyncio.create_task(_watchdog())
     last_poll = 0.0
     last_tick_at = time.time()
+    last_awake_at = awake_clock()
     used_successfully = False
     try:
         while client.is_connected and not stop_event.is_set():
             now = time.time()
+            awake = awake_clock()
             session.note_progress()
-            # Sleep / wake detection — a tick gap much larger than TICK means
-            # the host went to sleep. The BLE link is almost always in a
+            # Sleep / wake detection — the BLE link is almost always in a
             # stale state after wake, so we tear down the client and let the
-            # outer loop reconnect from a clean slate.
-            gap = now - last_tick_at
-            if last_tick_at > 0 and gap > TICK * 5:
+            # outer loop reconnect from a clean slate. Compare wall time with
+            # awake time rather than raw tick gaps: one iteration can
+            # legitimately take 20-30s (album art over BLE), and treating that
+            # as sleep tore down every fresh session in an endless loop.
+            slept = (now - last_tick_at) - (awake - last_awake_at)
+            if slept > SLEEP_GAP_S:
                 # Keep the cached address: the CoreBluetooth peer UUID survives
                 # sleep, and dropping it forces a full rescan — the slow, fragile
                 # path. The 3-consecutive-failure rule in main() still
                 # invalidates it if the peer really is gone.
-                log(f"Sleep/wake gap={gap:.0f}s — tearing down BLE client")
+                log(f"Sleep/wake: host slept {slept:.0f}s — tearing down BLE client")
                 break
             last_tick_at = now
+            last_awake_at = awake
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
@@ -1462,10 +1466,8 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
             await session.quick_calendar_sync()
             await session.quick_afk_sync()
             await session.quick_attention_sync()
-            await session.quick_bt_acc_sync()
             await session.maybe_send_token_history()
             await session.maybe_send_vacation()
-            await session.maybe_send_photo()
 
             try:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
@@ -1474,27 +1476,17 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     finally:
         # Cancel background tasks before tearing the link down so they don't
         # leak as "Task was destroyed but it is pending" against a dead client.
-        watchdog.cancel()
-        try:
-            await watchdog
-        except (asyncio.CancelledError, Exception):
-            pass
-        if session.photo_task and not session.photo_task.done():
-            session.photo_task.cancel()
-            try:
-                await session.photo_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if session.vacation_img_task and not session.vacation_img_task.done():
-            session.vacation_img_task.cancel()
-            try:
-                await session.vacation_img_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        try:
-            await client.disconnect()
-        except (BleakError, asyncio.TimeoutError):
-            pass
+        # Every await here is bounded: this runs after the watchdog is gone, so
+        # a hang would freeze the daemon for good (seen: disconnect() never
+        # returning because CoreBluetooth skipped the didDisconnect callback).
+        for task in (watchdog, session.vacation_img_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=DISCONNECT_TIMEOUT)
+                except (asyncio.CancelledError, Exception):
+                    pass
+        await safe_disconnect(client)
 
     log("Device disconnected" if not stop_event.is_set() else "Stopping")
     return used_successfully
@@ -1516,11 +1508,24 @@ async def main() -> None:
 
     log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
+    start_liveness_watchdog()
 
     backoff = 1
     consec_connect_failures = 0
+    # Set after repeated failures so the next round goes through discovery
+    # instead of hammering a known-good peer that has gone stale (macOS can
+    # remint a peer identity, e.g. after a re-pair).
+    skip_known_good = False
     while not stop_event.is_set():
+        heartbeat()
+        # Order matters: the scan-cached address first, then the peer that last
+        # actually delivered data, then a fresh scan. The known-good peer beats
+        # a scan because macOS hides peripherals it already holds a connection
+        # to (ours is bonded as an HID keyboard), so the only thing a scan can
+        # see may be a *different* nearby board.
         address = load_cached_address()
+        if not address and not skip_known_good:
+            address = load_last_good_address()
         if not address:
             address = await scan_for_device()
             if address:
@@ -1537,14 +1542,19 @@ async def main() -> None:
                 continue
 
         ok = await connect_and_run(address, stop_event)
+        if ok:
+            save_last_good_address(address)
+            skip_known_good = False
         if not ok:
             consec_connect_failures += 1
             # Keep the cached UUID across transient failures (e.g. laptop
             # wake-from-sleep) — only nuke it after several attempts, since
             # macOS can hold the peer in a stale state for a few seconds.
             if consec_connect_failures >= 3:
-                log("Connect failed 3x, invalidating cached address")
+                log("Connect failed 3x, invalidating cached address "
+                    "and forcing rediscovery")
                 SAVED_ADDR_FILE.unlink(missing_ok=True)
+                skip_known_good = True
                 consec_connect_failures = 0
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=backoff)
