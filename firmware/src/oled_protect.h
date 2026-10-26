@@ -17,4 +17,3 @@
 void oled_protect_init(void);
 void oled_protect_tick(void);
 void oled_protect_note_activity(void);    // call on touch / btn / BLE / screen change
-bool oled_protect_is_dark(void);          // true when panel is fully blanked

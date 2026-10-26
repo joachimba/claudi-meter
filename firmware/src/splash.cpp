@@ -155,9 +155,9 @@ void splash_tick(void) {
     }
 }
 
-void splash_next(void) {
+void splash_step(int dir) {
     if (SPLASH_ANIM_COUNT == 0) return;
-    cur_anim = (cur_anim + 1) % SPLASH_ANIM_COUNT;
+    cur_anim = (cur_anim + SPLASH_ANIM_COUNT + (dir < 0 ? -1 : 1)) % SPLASH_ANIM_COUNT;
     cur_frame = 0;
     frame_started_ms = millis();
     last_pick_ms = frame_started_ms;

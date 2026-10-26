@@ -2,7 +2,6 @@
 #include "splash.h"
 #include "splash_animations.h"
 #include "settings.h"
-#include "pomodoro.h"
 #include <lvgl.h>
 #include <string.h>
 #include <esp_heap_caps.h>
@@ -38,9 +37,17 @@ LV_FONT_DECLARE(font_mono_32);
 #define CONTENT_Y     100
 #define CONTENT_W     (SCR_W - 2 * MARGIN)   // 440
 
+// Root container of every page (splash lives in splash.cpp and is null here).
+static lv_obj_t* screen_root[SCREEN_COUNT] = {nullptr};
+
+// Page order for the left/right buttons. Splash sits outside the cycle.
+static const screen_t PAGE_ORDER[] = {
+    SCREEN_USAGE, SCREEN_HISTORY, SCREEN_VACATION, SCREEN_SPOTIFY,
+    SCREEN_CALENDAR, SCREEN_SETTINGS, SCREEN_BLUETOOTH,
+};
+#define PAGE_COUNT (sizeof(PAGE_ORDER) / sizeof(PAGE_ORDER[0]))
+
 // ---- Usage screen widgets ----
-static lv_obj_t* usage_container;
-static lv_obj_t* lbl_title;
 static lv_obj_t* bar_session;
 static lv_obj_t* lbl_session_pct;
 static lv_obj_t* lbl_session_label;
@@ -52,20 +59,19 @@ static lv_obj_t* lbl_weekly_reset;
 static lv_obj_t* lbl_anim;
 
 // ---- Spotify screen widgets ----
-static lv_obj_t* spotify_container;
 static lv_obj_t* spotify_panel;
 static lv_obj_t* lbl_spotify_state;
 static lv_obj_t* lbl_spotify_track;
 static lv_obj_t* lbl_spotify_artist;
 static lv_obj_t* img_spotify_art;
 static lv_image_dsc_t spotify_art_dsc;
-static bool spotify_art_seen = false;
 
-// Tiny pixel-art Clawd dancer below the Spotify panel — recycles the splash
-// engine's 20×20 sprite catalog at a smaller cell size so it sits in the
-// 120 px of space under the player card.
+// Pixel-art Clawd dancer below the Spotify panel — recycles the splash
+// engine's 20×20 sprite catalog at a smaller cell size so it fills the space
+// under the player card.
+#define SP_PANEL_H    170
 #define SP_DANCE_GRID 20
-#define SP_DANCE_CELL 5
+#define SP_DANCE_CELL 8
 #define SP_DANCE_W    (SP_DANCE_GRID * SP_DANCE_CELL)
 #define SP_DANCE_H    (SP_DANCE_GRID * SP_DANCE_CELL)
 static lv_obj_t* spotify_dance_canvas = nullptr;
@@ -88,41 +94,19 @@ static lv_color_t darken_rgb24(uint32_t rgb, uint8_t mix_pct) {
 }
 
 // ---- Calendar screen widgets ----
-static lv_obj_t* calendar_container;
 static lv_obj_t* lbl_calendar_state;
 static lv_obj_t* lbl_calendar_event;
 static lv_obj_t* lbl_calendar_when;
 
 // ---- Settings screen widgets ----
-static lv_obj_t* settings_container;
 static lv_obj_t* sw_auto_rotate;
-
-// ---- Pomodoro screen widgets ----
-static lv_obj_t* pomodoro_container;
-static lv_obj_t* pomodoro_arc;
-static lv_obj_t* lbl_pomodoro_state;
-static lv_obj_t* lbl_pomodoro_time;
-static lv_obj_t* lbl_pomodoro_cycles;
-static lv_obj_t* lbl_pomodoro_hint;
-
-// ---- Photo screen widgets ----
-static lv_obj_t* photo_container;
-static lv_obj_t* photo_canvas;
-static lv_obj_t* photo_caption_box;
-static lv_obj_t* lbl_photo_caption;
-static bool photo_have_image = false;
-
-// ---- Bluetooth Accessories screen widgets ----
-static lv_obj_t* btacc_container;
-static lv_obj_t* btacc_list_parent;
-static lv_obj_t* btacc_empty_label;
+static lv_obj_t* lbl_rotate_interval;
 
 // ---- Usage History (daily token graph) screen ----
 #define HG_W 440          // graph canvas width
 #define HG_H 200          // graph canvas height
 #define HG_PAD_TOP 16     // keep the peak off the top edge
 #define HG_BOTTOM_INSET 22 // clear the rounded display corners below the graph
-static lv_obj_t* history_container = nullptr;
 static lv_obj_t* lbl_hist_caption  = nullptr;   // "TOKENS / DAY"
 static lv_obj_t* lbl_hist_total    = nullptr;   // 30-day equivalent-cost total (top-right)
 static lv_obj_t* lbl_hist_value    = nullptr;   // big headline (today)
@@ -135,7 +119,6 @@ static HistoryData history_data    = {};        // last payload, kept for redraw
 #define VAC_TILE_MAX 3          // up to 3 digits (e.g. 365)
 #define VAC_TILE_W   74
 #define VAC_TILE_H   98
-static lv_obj_t* vacation_container = nullptr;
 static lv_obj_t* vac_canvas        = nullptr;   // full-screen backdrop (BLE vacimg buffer)
 static lv_obj_t* vac_overlay       = nullptr;   // full-screen dark tint for legibility
 static lv_obj_t* vac_tiles         = nullptr;   // centered row of digit cards
@@ -144,7 +127,7 @@ static lv_obj_t* vac_tile_lbl[VAC_TILE_MAX] = {nullptr};
 static lv_obj_t* lbl_vac_caption   = nullptr;   // "nights until"
 static lv_obj_t* lbl_vac_dest      = nullptr;   // destination name
 static lv_obj_t* lbl_vac_empty     = nullptr;   // "No trip set" placeholder
-static bool      vac_have_image    = false;
+static bool      vac_active        = false;     // trip configured? (else page is skipped)
 
 // ---- AFK overlay (sits above every screen when the host reports idle) ----
 #define AFK_ANIM_GRID 20
@@ -165,7 +148,6 @@ static uint32_t  afk_dismissed_ms = 0;
 #define AFK_SUPPRESS_MS (10UL * 60UL * 1000UL)
 
 // ---- Bluetooth screen widgets ----
-static lv_obj_t* ble_container;
 static lv_obj_t* lbl_ble_status;
 static lv_obj_t* lbl_ble_device;
 static lv_obj_t* lbl_ble_mac;
@@ -258,6 +240,42 @@ static void format_reset_time(int mins, char* buf, size_t len) {
 static void global_click_cb(lv_event_t* e);
 static void ble_reset_click_cb(lv_event_t* e);
 
+// Full-screen, transparent page root. Starts hidden; ui_show_screen() reveals it.
+static lv_obj_t* make_screen(lv_obj_t* parent) {
+    lv_obj_t* root = lv_obj_create(parent);
+    lv_obj_set_size(root, SCR_W, SCR_H);
+    lv_obj_set_pos(root, 0, 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(root, 0, 0);
+    lv_obj_set_style_pad_all(root, 0, 0);
+    lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(root, LV_OBJ_FLAG_HIDDEN);
+    return root;
+}
+
+// Serif page title, nudged right of centre to clear the corner logo.
+static void make_title(lv_obj_t* parent, const char* text) {
+    lv_obj_t* title = lv_label_create(parent);
+    lv_label_set_text(title, text);
+    lv_obj_set_style_text_font(title, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(title, COL_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+}
+
+// Rounded "pill" label styling shared by status chips across pages.
+static void style_pill(lv_obj_t* lbl, const lv_font_t* font, int pad_x, int pad_y,
+                       lv_color_t bg) {
+    lv_obj_set_style_text_font(lbl, font, 0);
+    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+    lv_obj_set_style_bg_color(lbl, bg, 0);
+    lv_obj_set_style_bg_opa(lbl, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(lbl, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_left(lbl, pad_x, 0);
+    lv_obj_set_style_pad_right(lbl, pad_x, 0);
+    lv_obj_set_style_pad_top(lbl, pad_y, 0);
+    lv_obj_set_style_pad_bottom(lbl, pad_y, 0);
+}
+
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
     lv_obj_set_pos(panel, x, y);
@@ -271,8 +289,8 @@ static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_set_style_pad_top(panel, 12, 0);
     lv_obj_set_style_pad_bottom(panel, 12, 0);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-    // Bubble click events up to the screen / usage_container so a tap anywhere
-    // on the panel fires the global click handler.
+    // Bubble click events up to the page root so a tap anywhere
+    // on the panel fires the page's click handler.
     lv_obj_add_flag(panel, LV_OBJ_FLAG_EVENT_BUBBLE);
     return panel;
 }
@@ -315,15 +333,7 @@ static void init_icon_dsc_rgb565a8(lv_image_dsc_t* dsc, int w, int h, const uint
 static lv_obj_t* make_pill(lv_obj_t* parent, const char* text) {
     lv_obj_t* lbl = lv_label_create(parent);
     lv_label_set_text(lbl, text);
-    lv_obj_set_style_text_font(lbl, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
-    lv_obj_set_style_bg_color(lbl, COL_BAR_BG, 0);
-    lv_obj_set_style_bg_opa(lbl, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(lbl, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_left(lbl, 18, 0);
-    lv_obj_set_style_pad_right(lbl, 18, 0);
-    lv_obj_set_style_pad_top(lbl, 6, 0);
-    lv_obj_set_style_pad_bottom(lbl, 6, 0);
+    style_pill(lbl, &font_styrene_28, 18, 6, COL_BAR_BG);
     return lbl;
 }
 
@@ -368,29 +378,20 @@ static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
 }
 
 static void init_usage_screen(lv_obj_t* scr) {
-    usage_container = lv_obj_create(scr);
-    lv_obj_set_size(usage_container, SCR_W, SCR_H);
-    lv_obj_set_pos(usage_container, 0, 0);
-    lv_obj_set_style_bg_opa(usage_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(usage_container, 0, 0);
-    lv_obj_set_style_pad_all(usage_container, 0, 0);
-    lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(usage_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* root = screen_root[SCREEN_USAGE] = make_screen(scr);
+    // Tapping Usage drops into the splash screensaver.
+    lv_obj_add_event_cb(root, global_click_cb, LV_EVENT_CLICKED, NULL);
 
-    lbl_title = lv_label_create(usage_container);
-    lv_label_set_text(lbl_title, "Usage");
-    lv_obj_set_style_text_font(lbl_title, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(lbl_title, COL_TEXT, 0);
-    lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+    make_title(root, "Usage");
 
-    make_usage_panel(usage_container, CONTENT_Y, "Current",
+    make_usage_panel(root, CONTENT_Y, "Current",
                      &lbl_session_pct, &lbl_session_label,
                      &bar_session, &lbl_session_reset);
-    make_usage_panel(usage_container, CONTENT_Y + PANEL_H + PANEL_GAP, "Weekly",
+    make_usage_panel(root, CONTENT_Y + PANEL_H + PANEL_GAP, "Weekly",
                      &lbl_weekly_pct, &lbl_weekly_label,
                      &bar_weekly, &lbl_weekly_reset);
 
-    lbl_anim = lv_label_create(usage_container);
+    lbl_anim = lv_label_create(root);
     lv_label_set_text(lbl_anim, "");
     lv_obj_set_style_text_font(lbl_anim, &font_mono_32, 0);
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
@@ -515,17 +516,10 @@ static void render_history_graph(void) {
 }
 
 static void init_history_screen(lv_obj_t* scr) {
-    history_container = lv_obj_create(scr);
-    lv_obj_set_size(history_container, SCR_W, SCR_H);
-    lv_obj_set_pos(history_container, 0, 0);
-    lv_obj_set_style_bg_opa(history_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(history_container, 0, 0);
-    lv_obj_set_style_pad_all(history_container, 0, 0);
-    lv_obj_clear_flag(history_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(history_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* root = screen_root[SCREEN_HISTORY] = make_screen(scr);
 
     // Header block sits below the persistent top-left logo (y clears 100px).
-    lbl_hist_caption = lv_label_create(history_container);
+    lbl_hist_caption = lv_label_create(root);
     lv_label_set_text(lbl_hist_caption, "TOKENS / DAY");
     lv_obj_set_style_text_font(lbl_hist_caption, &font_styrene_20, 0);
     lv_obj_set_style_text_color(lbl_hist_caption, COL_DIM, 0);
@@ -533,20 +527,20 @@ static void init_history_screen(lv_obj_t* scr) {
     lv_obj_set_pos(lbl_hist_caption, MARGIN, 104);
 
     // 30-day equivalent-cost total, right-aligned on the caption row.
-    lbl_hist_total = lv_label_create(history_container);
+    lbl_hist_total = lv_label_create(root);
     lv_label_set_text(lbl_hist_total, "");
     lv_obj_set_style_text_font(lbl_hist_total, &font_styrene_20, 0);
     lv_obj_set_style_text_color(lbl_hist_total, COL_DIM, 0);
     lv_obj_set_style_text_letter_space(lbl_hist_total, 2, 0);
     lv_obj_align(lbl_hist_total, LV_ALIGN_TOP_RIGHT, -MARGIN, 106);
 
-    lbl_hist_value = lv_label_create(history_container);
+    lbl_hist_value = lv_label_create(root);
     lv_label_set_text(lbl_hist_value, "--");
     lv_obj_set_style_text_font(lbl_hist_value, &font_tiempos_56, 0);
     lv_obj_set_style_text_color(lbl_hist_value, COL_TEXT, 0);
     lv_obj_set_pos(lbl_hist_value, MARGIN, 128);
 
-    lbl_hist_delta = lv_label_create(history_container);
+    lbl_hist_delta = lv_label_create(root);
     lv_label_set_text(lbl_hist_delta, "");
     lv_obj_set_style_text_font(lbl_hist_delta, &font_styrene_28, 0);
     lv_obj_set_style_text_color(lbl_hist_delta, COL_DIM, 0);
@@ -556,14 +550,12 @@ static void init_history_screen(lv_obj_t* scr) {
     history_buf = (uint16_t*)heap_caps_malloc(HG_W * HG_H * 2, MALLOC_CAP_SPIRAM);
     if (history_buf) {
         memset(history_buf, 0, HG_W * HG_H * 2);
-        history_canvas = lv_canvas_create(history_container);
+        history_canvas = lv_canvas_create(root);
         lv_canvas_set_buffer(history_canvas, history_buf, HG_W, HG_H,
                              LV_COLOR_FORMAT_RGB565);
         // Inset from the bottom so the curve baseline clears the rounded corners.
         lv_obj_set_pos(history_canvas, MARGIN, SCR_H - HG_H - HG_BOTTOM_INSET);
     }
-
-    lv_obj_add_flag(history_container, LV_OBJ_FLAG_HIDDEN);
 }
 
 void ui_update_history(const HistoryData* data) {
@@ -617,27 +609,21 @@ void ui_update_history(const HistoryData* data) {
 // ======== Vacation Countdown Screen — photo backdrop + big countdown ========
 
 static void init_vacation_screen(lv_obj_t* scr) {
-    vacation_container = lv_obj_create(scr);
-    lv_obj_set_size(vacation_container, SCR_W, SCR_H);
-    lv_obj_set_pos(vacation_container, 0, 0);
-    lv_obj_set_style_bg_color(vacation_container, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(vacation_container, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(vacation_container, 0, 0);
-    lv_obj_set_style_pad_all(vacation_container, 0, 0);
-    lv_obj_clear_flag(vacation_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(vacation_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* root = screen_root[SCREEN_VACATION] = make_screen(scr);
+    lv_obj_set_style_bg_color(root, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
 
     // Full-screen RGB565 backdrop, backed by the BLE vacation-image buffer.
-    vac_canvas = lv_canvas_create(vacation_container);
+    vac_canvas = lv_canvas_create(root);
     lv_canvas_set_buffer(vac_canvas, (void*)ble_vacimg_data(),
-                         BLE_PHOTO_W, BLE_PHOTO_H, LV_COLOR_FORMAT_RGB565);
+                         BLE_VACIMG_W, BLE_VACIMG_H, LV_COLOR_FORMAT_RGB565);
     lv_obj_set_pos(vac_canvas, 0, 0);
     lv_obj_set_style_pad_all(vac_canvas, 0, 0);
     lv_obj_set_style_border_width(vac_canvas, 0, 0);
     lv_obj_clear_flag(vac_canvas, LV_OBJ_FLAG_SCROLLABLE);
 
     // Whole-photo dark tint so white text reads anywhere over it.
-    vac_overlay = lv_obj_create(vacation_container);
+    vac_overlay = lv_obj_create(root);
     lv_obj_set_size(vac_overlay, SCR_W, SCR_H);
     lv_obj_set_pos(vac_overlay, 0, 0);
     lv_obj_set_style_bg_color(vac_overlay, lv_color_hex(0x0a1420), 0);
@@ -648,7 +634,7 @@ static void init_vacation_screen(lv_obj_t* scr) {
 
     // Row of flip-clock digit cards, centered.
     const int tiles_y = 150;
-    vac_tiles = lv_obj_create(vacation_container);
+    vac_tiles = lv_obj_create(root);
     lv_obj_set_size(vac_tiles, SCR_W, VAC_TILE_H);
     lv_obj_set_pos(vac_tiles, 0, tiles_y);
     lv_obj_set_style_bg_opa(vac_tiles, LV_OPA_TRANSP, 0);
@@ -694,7 +680,7 @@ static void init_vacation_screen(lv_obj_t* scr) {
     }
 
     // "nights until" caption, centered under the cards.
-    lbl_vac_caption = lv_label_create(vacation_container);
+    lbl_vac_caption = lv_label_create(root);
     lv_label_set_text(lbl_vac_caption, "nights until");
     lv_obj_set_style_text_font(lbl_vac_caption, &font_styrene_24, 0);
     lv_obj_set_style_text_color(lbl_vac_caption, lv_color_hex(0xd7dbe0), 0);
@@ -704,7 +690,7 @@ static void init_vacation_screen(lv_obj_t* scr) {
     lv_obj_set_pos(lbl_vac_caption, 0, tiles_y + VAC_TILE_H + 14);
 
     // Destination — big, centered, anchored near the bottom edge.
-    lbl_vac_dest = lv_label_create(vacation_container);
+    lbl_vac_dest = lv_label_create(root);
     lv_label_set_text(lbl_vac_dest, "");
     lv_obj_set_style_text_font(lbl_vac_dest, &font_styrene_48, 0);
     lv_obj_set_style_text_color(lbl_vac_dest, lv_color_hex(0xffffff), 0);
@@ -714,15 +700,13 @@ static void init_vacation_screen(lv_obj_t* scr) {
     lv_obj_align(lbl_vac_dest, LV_ALIGN_BOTTOM_MID, 0, -42);
 
     // Placeholder shown when no trip is configured.
-    lbl_vac_empty = lv_label_create(vacation_container);
+    lbl_vac_empty = lv_label_create(root);
     lv_label_set_text(lbl_vac_empty, "No trip set\nAdd one from the Mac menu");
     lv_obj_set_style_text_font(lbl_vac_empty, &font_styrene_24, 0);
     lv_obj_set_style_text_color(lbl_vac_empty, COL_DIM, 0);
     lv_obj_set_style_text_align(lbl_vac_empty, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(lbl_vac_empty, LV_ALIGN_CENTER, 0, 40);
     lv_obj_add_flag(lbl_vac_empty, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_add_flag(vacation_container, LV_OBJ_FLAG_HIDDEN);
 }
 
 // Toggle the countdown widgets vs the "no trip" placeholder.
@@ -742,11 +726,13 @@ static void vac_show_countdown(bool on) {
 void ui_update_vacation(const VacationData* data) {
     if (!data || !data->valid || !vac_tiles) return;
 
-    if (!data->active) {
-        vac_show_countdown(false);
+    vac_active = data->active;
+    vac_show_countdown(vac_active);
+    if (!vac_active) {
+        // Trip ended / removed: drop off the page cycle if we're sitting on it.
+        if (current_screen == SCREEN_VACATION) ui_show_screen(SCREEN_USAGE);
         return;
     }
-    vac_show_countdown(true);
 
     // Number shown in the cards (clamped 0..999) and its caption.
     int disp = data->days;
@@ -779,30 +765,17 @@ void ui_update_vacation(const VacationData* data) {
 
 void ui_update_vacation_image(const uint8_t* rgb565) {
     if (!vac_canvas || !rgb565) return;
-    vac_have_image = true;
     lv_obj_invalidate(vac_canvas);
 }
 
 // ======== Bluetooth Screen (480x480) ========
 
 static void init_bluetooth_screen(lv_obj_t* scr) {
-    ble_container = lv_obj_create(scr);
-    lv_obj_set_size(ble_container, SCR_W, SCR_H);
-    lv_obj_set_pos(ble_container, 0, 0);
-    lv_obj_set_style_bg_opa(ble_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ble_container, 0, 0);
-    lv_obj_set_style_pad_all(ble_container, 0, 0);
-    lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Title
-    lv_obj_t* lbl_ble_title = lv_label_create(ble_container);
-    lv_label_set_text(lbl_ble_title, "Bluetooth");
-    lv_obj_set_style_text_font(lbl_ble_title, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(lbl_ble_title, COL_TEXT, 0);
-    lv_obj_align(lbl_ble_title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+    lv_obj_t* root = screen_root[SCREEN_BLUETOOTH] = make_screen(scr);
+    make_title(root, "Bluetooth");
 
     // Info panel (taller for 480x480)
-    lv_obj_t* p_info = make_panel(ble_container, MARGIN, CONTENT_Y, CONTENT_W, 160);
+    lv_obj_t* p_info = make_panel(root, MARGIN, CONTENT_Y, CONTENT_W, 160);
 
     // Bluetooth icon + status row
     static lv_image_dsc_t icon_bt_dsc;
@@ -832,7 +805,7 @@ static void init_bluetooth_screen(lv_obj_t* scr) {
 
     // Reset Bluetooth tap zone with trash icon
     int reset_y = CONTENT_Y + 160 + 16;
-    lv_obj_t* reset_zone = lv_obj_create(ble_container);
+    lv_obj_t* reset_zone = lv_obj_create(root);
     lv_obj_set_pos(reset_zone, MARGIN, reset_y);
     lv_obj_set_size(reset_zone, CONTENT_W, 110);
     lv_obj_set_style_bg_color(reset_zone, COL_PANEL, 0);
@@ -854,30 +827,24 @@ static void init_bluetooth_screen(lv_obj_t* scr) {
     lv_label_set_text(reset_lbl, "Reset Bluetooth");
     lv_obj_set_style_text_font(reset_lbl, &font_styrene_28, 0);
     lv_obj_set_style_text_color(reset_lbl, COL_DIM, 0);
-
-    // Start hidden
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ======== Spotify Screen (480x480) ========
 
+// Tap anywhere on the page toggles play/pause; the daemon runs the AppleScript
+// and the next quick-sync updates the state pill.
+static void spotify_click_cb(lv_event_t* e) {
+    (void)e;
+    ble_send_cmd(BLE_CMD_SPOTIFY_PLAYPAUSE);
+}
+
 static void init_spotify_screen(lv_obj_t* scr) {
-    spotify_container = lv_obj_create(scr);
-    lv_obj_set_size(spotify_container, SCR_W, SCR_H);
-    lv_obj_set_pos(spotify_container, 0, 0);
-    lv_obj_set_style_bg_opa(spotify_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(spotify_container, 0, 0);
-    lv_obj_set_style_pad_all(spotify_container, 0, 0);
-    lv_obj_clear_flag(spotify_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(spotify_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* root = screen_root[SCREEN_SPOTIFY] = make_screen(scr);
+    lv_obj_add_event_cb(root, spotify_click_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t* title = lv_label_create(spotify_container);
-    lv_label_set_text(title, "Spotify");
-    lv_obj_set_style_text_font(title, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(title, COL_TEXT, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+    make_title(root, "Spotify");
 
-    spotify_panel = make_panel(spotify_container, MARGIN, CONTENT_Y, CONTENT_W, 260);
+    spotify_panel = make_panel(root, MARGIN, CONTENT_Y, CONTENT_W, SP_PANEL_H);
     lv_obj_t* panel = spotify_panel;
 
     img_spotify_art = lv_image_create(panel);
@@ -893,15 +860,7 @@ static void init_spotify_screen(lv_obj_t* scr) {
     // "NOW PLAYING" / "PAUSED" mini-pill above the title for a music-app look.
     lbl_spotify_state = lv_label_create(panel);
     lv_label_set_text(lbl_spotify_state, "IDLE");
-    lv_obj_set_style_text_font(lbl_spotify_state, &font_styrene_20, 0);
-    lv_obj_set_style_text_color(lbl_spotify_state, COL_TEXT, 0);
-    lv_obj_set_style_bg_color(lbl_spotify_state, COL_BAR_BG, 0);
-    lv_obj_set_style_bg_opa(lbl_spotify_state, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(lbl_spotify_state, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_left(lbl_spotify_state, 12, 0);
-    lv_obj_set_style_pad_right(lbl_spotify_state, 12, 0);
-    lv_obj_set_style_pad_top(lbl_spotify_state, 4, 0);
-    lv_obj_set_style_pad_bottom(lbl_spotify_state, 4, 0);
+    style_pill(lbl_spotify_state, &font_styrene_20, 12, 4, COL_BAR_BG);
     lv_obj_set_pos(lbl_spotify_state, text_x, 10);
 
     lbl_spotify_track = lv_label_create(panel);
@@ -925,12 +884,12 @@ static void init_spotify_screen(lv_obj_t* scr) {
                                                     MALLOC_CAP_SPIRAM);
     if (spotify_dance_buf) {
         memset(spotify_dance_buf, 0, SP_DANCE_W * SP_DANCE_H * 2);
-        spotify_dance_canvas = lv_canvas_create(spotify_container);
+        spotify_dance_canvas = lv_canvas_create(root);
         lv_canvas_set_buffer(spotify_dance_canvas, spotify_dance_buf,
                              SP_DANCE_W, SP_DANCE_H, LV_COLOR_FORMAT_RGB565);
         lv_obj_set_pos(spotify_dance_canvas,
                        (SCR_W - SP_DANCE_W) / 2,
-                       CONTENT_Y + 260 + 10);
+                       CONTENT_Y + SP_PANEL_H + 20);
         // Pick a Dance-category animation. Fall back to the first animation
         // if none is found (catalog could change after a re-scrape).
         spotify_dance_idx = -1;
@@ -944,8 +903,6 @@ static void init_spotify_screen(lv_obj_t* scr) {
             spotify_dance_idx = 0;
         }
     }
-
-    lv_obj_add_flag(spotify_container, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void render_spotify_dance_frame(const splash_anim_def_t* a, int frame) {
@@ -970,35 +927,15 @@ static void render_spotify_dance_frame(const splash_anim_def_t* a, int frame) {
 // ======== Calendar Screen (480x480) ========
 
 static void init_calendar_screen(lv_obj_t* scr) {
-    calendar_container = lv_obj_create(scr);
-    lv_obj_set_size(calendar_container, SCR_W, SCR_H);
-    lv_obj_set_pos(calendar_container, 0, 0);
-    lv_obj_set_style_bg_opa(calendar_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(calendar_container, 0, 0);
-    lv_obj_set_style_pad_all(calendar_container, 0, 0);
-    lv_obj_clear_flag(calendar_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(calendar_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* root = screen_root[SCREEN_CALENDAR] = make_screen(scr);
+    make_title(root, "Up Next");
 
-    lv_obj_t* title = lv_label_create(calendar_container);
-    lv_label_set_text(title, "Up Next");
-    lv_obj_set_style_text_font(title, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(title, COL_TEXT, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
-
-    lv_obj_t* panel = make_panel(calendar_container, MARGIN, CONTENT_Y, CONTENT_W, 260);
+    lv_obj_t* panel = make_panel(root, MARGIN, CONTENT_Y, CONTENT_W, 260);
 
     // "UP NEXT" pill at the top of the panel; mirrors the Spotify status pill.
     lbl_calendar_state = lv_label_create(panel);
     lv_label_set_text(lbl_calendar_state, "CALENDAR");
-    lv_obj_set_style_text_font(lbl_calendar_state, &font_styrene_20, 0);
-    lv_obj_set_style_text_color(lbl_calendar_state, COL_TEXT, 0);
-    lv_obj_set_style_bg_color(lbl_calendar_state, COL_ACCENT, 0);
-    lv_obj_set_style_bg_opa(lbl_calendar_state, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(lbl_calendar_state, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_left(lbl_calendar_state, 12, 0);
-    lv_obj_set_style_pad_right(lbl_calendar_state, 12, 0);
-    lv_obj_set_style_pad_top(lbl_calendar_state, 4, 0);
-    lv_obj_set_style_pad_bottom(lbl_calendar_state, 4, 0);
+    style_pill(lbl_calendar_state, &font_styrene_20, 12, 4, COL_ACCENT);
     lv_obj_set_pos(lbl_calendar_state, 0, 4);
 
     // Subtle accent-coloured vertical bar to the left of the event title.
@@ -1022,18 +959,8 @@ static void init_calendar_screen(lv_obj_t* scr) {
     // Time-until pill at the bottom.
     lbl_calendar_when = lv_label_create(panel);
     lv_label_set_text(lbl_calendar_when, "\xE2\x80\x94");
-    lv_obj_set_style_text_font(lbl_calendar_when, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(lbl_calendar_when, COL_TEXT, 0);
-    lv_obj_set_style_bg_color(lbl_calendar_when, COL_BAR_BG, 0);
-    lv_obj_set_style_bg_opa(lbl_calendar_when, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(lbl_calendar_when, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_left(lbl_calendar_when, 16, 0);
-    lv_obj_set_style_pad_right(lbl_calendar_when, 16, 0);
-    lv_obj_set_style_pad_top(lbl_calendar_when, 6, 0);
-    lv_obj_set_style_pad_bottom(lbl_calendar_when, 6, 0);
+    style_pill(lbl_calendar_when, &font_styrene_28, 16, 6, COL_BAR_BG);
     lv_obj_set_pos(lbl_calendar_when, 0, 190);
-
-    lv_obj_add_flag(calendar_container, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ======== Settings Screen (480x480) ========
@@ -1058,6 +985,28 @@ static void on_auto_rotate_row_clicked(lv_event_t* e) {
     settings_set_auto_rotate(now_on);
 }
 
+// Tap cycles through a few sensible auto-rotate intervals (persisted).
+static const uint16_t ROTATE_INTERVALS[] = {15, 30, 60, 120, 300};
+#define ROTATE_INTERVAL_COUNT (sizeof(ROTATE_INTERVALS) / sizeof(ROTATE_INTERVALS[0]))
+
+static void refresh_rotate_interval_label(void) {
+    if (!lbl_rotate_interval) return;
+    unsigned s = settings_rotate_interval_sec();
+    if (s >= 60 && s % 60 == 0) lv_label_set_text_fmt(lbl_rotate_interval, "%u min", s / 60);
+    else                        lv_label_set_text_fmt(lbl_rotate_interval, "%u s", s);
+}
+
+static void on_rotate_interval_row_clicked(lv_event_t* e) {
+    (void)e;
+    uint16_t cur = settings_rotate_interval_sec();
+    uint16_t next = ROTATE_INTERVALS[0];
+    for (size_t i = 0; i < ROTATE_INTERVAL_COUNT; i++) {
+        if (ROTATE_INTERVALS[i] > cur) { next = ROTATE_INTERVALS[i]; break; }
+    }
+    settings_set_rotate_interval_sec(next);
+    refresh_rotate_interval_label();
+}
+
 static void on_bluetooth_row_clicked(lv_event_t* e) {
     (void)e;
     ui_show_screen(SCREEN_BLUETOOTH);
@@ -1078,25 +1027,13 @@ static lv_obj_t* make_settings_row(lv_obj_t* parent, int y, int h) {
 }
 
 static void init_settings_screen(lv_obj_t* scr) {
-    settings_container = lv_obj_create(scr);
-    lv_obj_set_size(settings_container, SCR_W, SCR_H);
-    lv_obj_set_pos(settings_container, 0, 0);
-    lv_obj_set_style_bg_opa(settings_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(settings_container, 0, 0);
-    lv_obj_set_style_pad_all(settings_container, 0, 0);
-    lv_obj_clear_flag(settings_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(settings_container, global_click_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* title = lv_label_create(settings_container);
-    lv_label_set_text(title, "Settings");
-    lv_obj_set_style_text_font(title, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(title, COL_TEXT, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+    lv_obj_t* root = screen_root[SCREEN_SETTINGS] = make_screen(scr);
+    make_title(root, "Settings");
 
     // Row 1: auto-rotate (whole row is a tap target)
     int y = CONTENT_Y;
     int row_h = 80;
-    lv_obj_t* row1 = make_settings_row(settings_container, y, row_h);
+    lv_obj_t* row1 = make_settings_row(root, y, row_h);
     lv_obj_add_event_cb(row1, on_auto_rotate_row_clicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t* l1 = lv_label_create(row1);
     lv_label_set_text(l1, "Auto-rotate screens");
@@ -1111,26 +1048,25 @@ static void init_settings_screen(lv_obj_t* scr) {
     lv_obj_set_style_bg_color(sw_auto_rotate, COL_ACCENT, LV_PART_INDICATOR | LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw_auto_rotate, on_auto_rotate_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Row 2: rotate interval (read-only display for now)
+    // Row 2: rotate interval (tap to cycle)
     y += row_h + 12;
-    lv_obj_t* row2 = make_settings_row(settings_container, y, row_h);
+    lv_obj_t* row2 = make_settings_row(root, y, row_h);
+    lv_obj_add_event_cb(row2, on_rotate_interval_row_clicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t* l2 = lv_label_create(row2);
     lv_label_set_text(l2, "Rotate every");
     lv_obj_set_style_text_font(l2, &font_styrene_28, 0);
     lv_obj_set_style_text_color(l2, COL_TEXT, 0);
     lv_obj_align(l2, LV_ALIGN_LEFT_MID, 0, 0);
 
-    lv_obj_t* l2v = lv_label_create(row2);
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%us", (unsigned)settings_rotate_interval_sec());
-    lv_label_set_text(l2v, buf);
-    lv_obj_set_style_text_font(l2v, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(l2v, COL_DIM, 0);
-    lv_obj_align(l2v, LV_ALIGN_RIGHT_MID, 0, 0);
+    lbl_rotate_interval = lv_label_create(row2);
+    lv_obj_set_style_text_font(lbl_rotate_interval, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(lbl_rotate_interval, COL_DIM, 0);
+    lv_obj_align(lbl_rotate_interval, LV_ALIGN_RIGHT_MID, 0, 0);
+    refresh_rotate_interval_label();
 
     // Row 3: Bluetooth entry (tap → BT screen)
     y += row_h + 12;
-    lv_obj_t* row3 = make_settings_row(settings_container, y, row_h);
+    lv_obj_t* row3 = make_settings_row(root, y, row_h);
     lv_obj_add_event_cb(row3, on_bluetooth_row_clicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t* l3 = lv_label_create(row3);
     lv_label_set_text(l3, "Bluetooth");
@@ -1143,227 +1079,7 @@ static void init_settings_screen(lv_obj_t* scr) {
     lv_obj_set_style_text_color(l3a, COL_DIM, 0);
     lv_obj_align(l3a, LV_ALIGN_RIGHT_MID, 0, 0);
 
-    lv_obj_add_flag(settings_container, LV_OBJ_FLAG_HIDDEN);
-}
-
-// ======== Pomodoro Screen (480x480) ========
-
-static void pomodoro_click_cb(lv_event_t* e) {
-    (void)e;
-    pomodoro_toggle_pause();
-}
-
-static void pomodoro_long_press_cb(lv_event_t* e) {
-    (void)e;
-    pomodoro_reset();
-}
-
-static void init_pomodoro_screen(lv_obj_t* scr) {
-    pomodoro_container = lv_obj_create(scr);
-    lv_obj_set_size(pomodoro_container, SCR_W, SCR_H);
-    lv_obj_set_pos(pomodoro_container, 0, 0);
-    lv_obj_set_style_bg_opa(pomodoro_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(pomodoro_container, 0, 0);
-    lv_obj_set_style_pad_all(pomodoro_container, 0, 0);
-    lv_obj_clear_flag(pomodoro_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(pomodoro_container, pomodoro_click_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(pomodoro_container, pomodoro_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
-
-    lv_obj_t* title = lv_label_create(pomodoro_container);
-    lv_label_set_text(title, "Pomodoro");
-    lv_obj_set_style_text_font(title, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(title, COL_TEXT, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
-
-    // Big circular progress arc with the countdown centred inside.
-    pomodoro_arc = lv_arc_create(pomodoro_container);
-    lv_obj_set_size(pomodoro_arc, 300, 300);
-    lv_obj_align(pomodoro_arc, LV_ALIGN_TOP_MID, 0, CONTENT_Y - 20);
-    lv_arc_set_range(pomodoro_arc, 0, 1000);
-    lv_arc_set_bg_angles(pomodoro_arc, 0, 360);
-    lv_arc_set_rotation(pomodoro_arc, 270);
-    lv_arc_set_value(pomodoro_arc, 0);
-    lv_obj_remove_style(pomodoro_arc, NULL, LV_PART_KNOB);
-    lv_obj_clear_flag(pomodoro_arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_color(pomodoro_arc, COL_BAR_BG,   LV_PART_MAIN);
-    lv_obj_set_style_arc_color(pomodoro_arc, COL_ACCENT,   LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(pomodoro_arc, 14,           LV_PART_MAIN);
-    lv_obj_set_style_arc_width(pomodoro_arc, 14,           LV_PART_INDICATOR);
-
-    // State pill ("FOCUS" / "BREAK" / "READY").
-    lbl_pomodoro_state = lv_label_create(pomodoro_container);
-    lv_label_set_text(lbl_pomodoro_state, "READY");
-    lv_obj_set_style_text_font(lbl_pomodoro_state, &font_styrene_20, 0);
-    lv_obj_set_style_text_color(lbl_pomodoro_state, COL_TEXT, 0);
-    lv_obj_set_style_bg_color(lbl_pomodoro_state, COL_BAR_BG, 0);
-    lv_obj_set_style_bg_opa(lbl_pomodoro_state, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(lbl_pomodoro_state, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_left(lbl_pomodoro_state, 14, 0);
-    lv_obj_set_style_pad_right(lbl_pomodoro_state, 14, 0);
-    lv_obj_set_style_pad_top(lbl_pomodoro_state, 4, 0);
-    lv_obj_set_style_pad_bottom(lbl_pomodoro_state, 4, 0);
-    lv_obj_align(lbl_pomodoro_state, LV_ALIGN_TOP_MID, 0, CONTENT_Y + 60);
-
-    // Big mm:ss countdown.
-    lbl_pomodoro_time = lv_label_create(pomodoro_container);
-    lv_label_set_text(lbl_pomodoro_time, "25:00");
-    lv_obj_set_style_text_font(lbl_pomodoro_time, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(lbl_pomodoro_time, COL_TEXT, 0);
-    lv_obj_align(lbl_pomodoro_time, LV_ALIGN_TOP_MID, 0, CONTENT_Y + 110);
-
-    lbl_pomodoro_cycles = lv_label_create(pomodoro_container);
-    lv_label_set_text(lbl_pomodoro_cycles, "Cycle 0");
-    lv_obj_set_style_text_font(lbl_pomodoro_cycles, &font_styrene_24, 0);
-    lv_obj_set_style_text_color(lbl_pomodoro_cycles, COL_DIM, 0);
-    lv_obj_align(lbl_pomodoro_cycles, LV_ALIGN_TOP_MID, 0, CONTENT_Y + 180);
-
-    lbl_pomodoro_hint = lv_label_create(pomodoro_container);
-    lv_label_set_text(lbl_pomodoro_hint, "Tap to start  /  hold to reset");
-    lv_obj_set_style_text_font(lbl_pomodoro_hint, &font_styrene_20, 0);
-    lv_obj_set_style_text_color(lbl_pomodoro_hint, COL_DIM, 0);
-    lv_obj_align(lbl_pomodoro_hint, LV_ALIGN_BOTTOM_MID, 0, -22);
-
-    lv_obj_add_flag(pomodoro_container, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void ui_refresh_pomodoro(void) {
-    if (!pomodoro_arc) return;
-    pomo_state_t st = pomodoro_state();
-    uint32_t remaining = pomodoro_remaining_ms();
-    uint32_t total = pomodoro_phase_total_ms();
-    bool paused = pomodoro_paused();
-    uint16_t cycles = pomodoro_completed_work();
-
-    int mins = remaining / 60000;
-    int secs = (remaining % 60000) / 1000;
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%02d:%02d", mins, secs);
-    lv_label_set_text(lbl_pomodoro_time, buf);
-
-    const char* state_text = "READY";
-    lv_color_t state_bg = COL_BAR_BG;
-    lv_color_t state_fg = COL_DIM;
-    if (st == POMO_WORKING) {
-        state_text = paused ? "FOCUS PAUSED" : "FOCUS";
-        state_bg   = paused ? COL_BAR_BG : COL_ACCENT;
-        state_fg   = paused ? COL_DIM    : COL_TEXT;
-    } else if (st == POMO_BREAK) {
-        state_text = paused ? "BREAK PAUSED" : "BREAK";
-        state_bg   = paused ? COL_BAR_BG : COL_GREEN;
-        state_fg   = COL_TEXT;
-    }
-    lv_label_set_text(lbl_pomodoro_state, state_text);
-    lv_obj_set_style_bg_color(lbl_pomodoro_state, state_bg, 0);
-    lv_obj_set_style_text_color(lbl_pomodoro_state, state_fg, 0);
-
-    int arc_val = 0;
-    if (total > 0 && st != POMO_IDLE) {
-        // Progress shows time elapsed (so the arc fills as the phase advances).
-        uint32_t elapsed = (total >= remaining) ? (total - remaining) : 0;
-        arc_val = (int)((uint64_t)elapsed * 1000 / total);
-    }
-    lv_arc_set_value(pomodoro_arc, arc_val);
-    lv_obj_set_style_arc_color(pomodoro_arc,
-        st == POMO_BREAK ? COL_GREEN : COL_ACCENT, LV_PART_INDICATOR);
-
-    char cbuf[24];
-    if (cycles > 0) snprintf(cbuf, sizeof(cbuf), "Cycle %u", (unsigned)cycles);
-    else            snprintf(cbuf, sizeof(cbuf), "-");
-    lv_label_set_text(lbl_pomodoro_cycles, cbuf);
-
-    if (st == POMO_IDLE) {
-        lv_label_set_text(lbl_pomodoro_hint, "Tap to start  /  hold to reset");
-    } else if (paused) {
-        lv_label_set_text(lbl_pomodoro_hint, "Tap to resume  /  hold to reset");
-    } else {
-        lv_label_set_text(lbl_pomodoro_hint, "Tap to pause  /  hold to reset");
-    }
-}
-
-// ======== Photo Screen (480x480) ========
-
-static void init_photo_screen(lv_obj_t* scr) {
-    photo_container = lv_obj_create(scr);
-    lv_obj_set_size(photo_container, SCR_W, SCR_H);
-    lv_obj_set_pos(photo_container, 0, 0);
-    lv_obj_set_style_bg_color(photo_container, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(photo_container, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(photo_container, 0, 0);
-    lv_obj_set_style_pad_all(photo_container, 0, 0);
-    lv_obj_clear_flag(photo_container, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Full-screen RGB565 canvas backed by the BLE photo PSRAM buffer.
-    photo_canvas = lv_canvas_create(photo_container);
-    lv_canvas_set_buffer(photo_canvas, (void*)ble_photo_data(),
-                         BLE_PHOTO_W, BLE_PHOTO_H, LV_COLOR_FORMAT_RGB565);
-    lv_obj_set_pos(photo_canvas, 0, 0);
-    lv_obj_set_style_pad_all(photo_canvas, 0, 0);
-    lv_obj_set_style_border_width(photo_canvas, 0, 0);
-    lv_obj_set_style_radius(photo_canvas, 0, 0);
-    lv_obj_clear_flag(photo_canvas, LV_OBJ_FLAG_SCROLLABLE);
-    // Show canvas immediately (with the zero-init black buffer) so the user
-    // sees a steady black background instead of flicker, and `ui_set_photo_loading`
-    // takes it over from there once a transfer is in flight.
-    lv_obj_clear_flag(photo_canvas, LV_OBJ_FLAG_HIDDEN);
-
-    // Caption pill bottom-left over a translucent panel so it stays legible
-    // against any photo.
-    photo_caption_box = lv_obj_create(photo_container);
-    lv_obj_set_size(photo_caption_box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_pos(photo_caption_box, 24, SCR_H - 60);
-    lv_obj_set_style_bg_color(photo_caption_box, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(photo_caption_box, LV_OPA_70, 0);
-    lv_obj_set_style_radius(photo_caption_box, 8, 0);
-    lv_obj_set_style_border_width(photo_caption_box, 0, 0);
-    lv_obj_set_style_pad_left(photo_caption_box, 14, 0);
-    lv_obj_set_style_pad_right(photo_caption_box, 14, 0);
-    lv_obj_set_style_pad_top(photo_caption_box, 6, 0);
-    lv_obj_set_style_pad_bottom(photo_caption_box, 6, 0);
-    lv_obj_clear_flag(photo_caption_box, LV_OBJ_FLAG_SCROLLABLE);
-
-    lbl_photo_caption = lv_label_create(photo_caption_box);
-    lv_label_set_text(lbl_photo_caption, "Waiting for photo...");
-    lv_obj_set_style_text_font(lbl_photo_caption, &font_styrene_24, 0);
-    lv_obj_set_style_text_color(lbl_photo_caption, lv_color_hex(0xffffff), 0);
-
-    lv_obj_add_flag(photo_container, LV_OBJ_FLAG_HIDDEN);
-}
-
-// ======== Bluetooth Accessories Screen (480x480) ========
-
-static void init_btacc_screen(lv_obj_t* scr) {
-    btacc_container = lv_obj_create(scr);
-    lv_obj_set_size(btacc_container, SCR_W, SCR_H);
-    lv_obj_set_pos(btacc_container, 0, 0);
-    lv_obj_set_style_bg_opa(btacc_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(btacc_container, 0, 0);
-    lv_obj_set_style_pad_all(btacc_container, 0, 0);
-    lv_obj_clear_flag(btacc_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(btacc_container, global_click_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* title = lv_label_create(btacc_container);
-    lv_label_set_text(title, "Accessories");
-    lv_obj_set_style_text_font(title, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(title, COL_TEXT, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
-
-    btacc_list_parent = lv_obj_create(btacc_container);
-    lv_obj_set_pos(btacc_list_parent, MARGIN, CONTENT_Y);
-    lv_obj_set_size(btacc_list_parent, CONTENT_W, SCR_H - CONTENT_Y - MARGIN);
-    lv_obj_set_style_bg_opa(btacc_list_parent, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(btacc_list_parent, 0, 0);
-    lv_obj_set_style_pad_all(btacc_list_parent, 0, 0);
-    lv_obj_set_flex_flow(btacc_list_parent, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(btacc_list_parent, 10, 0);
-    lv_obj_clear_flag(btacc_list_parent, LV_OBJ_FLAG_SCROLLABLE);
-
-    btacc_empty_label = lv_label_create(btacc_container);
-    lv_label_set_text(btacc_empty_label, "No connected accessories");
-    lv_obj_set_style_text_font(btacc_empty_label, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(btacc_empty_label, COL_DIM, 0);
-    lv_obj_align(btacc_empty_label, LV_ALIGN_CENTER, 0, 0);
-
-    lv_obj_add_flag(btacc_container, LV_OBJ_FLAG_HIDDEN);
+    if (settings_auto_rotate()) lv_obj_add_state(sw_auto_rotate, LV_STATE_CHECKED);
 }
 
 // ======== AFK Overlay ========
@@ -1474,16 +1190,10 @@ void ui_init(void) {
     init_vacation_screen(scr);
     init_spotify_screen(scr);
     init_calendar_screen(scr);
-    init_pomodoro_screen(scr);
-    init_photo_screen(scr);
-    init_btacc_screen(scr);
     init_settings_screen(scr);
     init_bluetooth_screen(scr);
     splash_init(scr);
     init_afk_overlay(scr);
-
-    ui_refresh_settings();
-    ui_refresh_pomodoro();
 
     // Splash is touch-toggled — tap anywhere on the splash dismisses it
     if (splash_get_root()) {
@@ -1565,7 +1275,6 @@ void ui_update_spotify_art(const uint8_t* rgb565, int w, int h) {
     // Re-set src every update so LVGL's image cache invalidates and re-reads
     // the (mutated-in-place) PSRAM buffer for the new track.
     lv_image_set_src(img_spotify_art, &spotify_art_dsc);
-    spotify_art_seen = true;
     lv_obj_clear_flag(img_spotify_art, LV_OBJ_FLAG_HIDDEN);
     lv_obj_invalidate(img_spotify_art);
 }
@@ -1582,69 +1291,6 @@ static void format_when(int mins, char* buf, size_t len) {
     } else {
         snprintf(buf, len, "in %dd %dh", mins / 1440, (mins % 1440) / 60);
     }
-}
-
-void ui_refresh_settings(void) {
-    if (!sw_auto_rotate) return;
-    if (settings_auto_rotate()) lv_obj_add_state(sw_auto_rotate, LV_STATE_CHECKED);
-    else                        lv_obj_clear_state(sw_auto_rotate, LV_STATE_CHECKED);
-}
-
-void ui_update_bt_accessories(const BTAccessoriesData* data) {
-    if (!btacc_list_parent) return;
-    lv_obj_clean(btacc_list_parent);
-    if (!data || !data->valid || data->count == 0) {
-        if (btacc_empty_label) lv_obj_clear_flag(btacc_empty_label, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
-    if (btacc_empty_label) lv_obj_add_flag(btacc_empty_label, LV_OBJ_FLAG_HIDDEN);
-
-    for (uint8_t i = 0; i < data->count && i < BT_ACC_MAX; i++) {
-        const BTAccessory& a = data->items[i];
-
-        lv_obj_t* row = lv_obj_create(btacc_list_parent);
-        lv_obj_set_size(row, CONTENT_W, 56);
-        lv_obj_set_style_bg_color(row, COL_PANEL, 0);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(row, 8, 0);
-        lv_obj_set_style_border_width(row, 0, 0);
-        lv_obj_set_style_pad_left(row, 18, 0);
-        lv_obj_set_style_pad_right(row, 18, 0);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-        lv_obj_t* name_lbl = lv_label_create(row);
-        lv_label_set_text(name_lbl, a.name);
-        lv_obj_set_style_text_font(name_lbl, &font_styrene_24, 0);
-        lv_obj_set_style_text_color(name_lbl, COL_TEXT, 0);
-        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(name_lbl, CONTENT_W - 36 - 110);
-        lv_obj_align(name_lbl, LV_ALIGN_LEFT_MID, 0, 0);
-
-        char pctbuf[16];
-        if (a.battery_pct < 0) snprintf(pctbuf, sizeof(pctbuf), "—");
-        else                   snprintf(pctbuf, sizeof(pctbuf), "%d%%%s",
-                                        a.battery_pct, a.charging ? "+" : "");
-        lv_obj_t* pct_lbl = lv_label_create(row);
-        lv_label_set_text(pct_lbl, pctbuf);
-        lv_obj_set_style_text_font(pct_lbl, &font_styrene_28, 0);
-        // Tint by level: red ≤20, amber ≤50, green otherwise.
-        lv_color_t c = COL_GREEN;
-        if (a.battery_pct >= 0 && a.battery_pct <= 20)      c = COL_RED;
-        else if (a.battery_pct >= 0 && a.battery_pct <= 50) c = COL_AMBER;
-        else if (a.battery_pct < 0)                         c = COL_DIM;
-        lv_obj_set_style_text_color(pct_lbl, c, 0);
-        lv_obj_align(pct_lbl, LV_ALIGN_RIGHT_MID, 0, 0);
-    }
-}
-
-void ui_update_photo_caption(const PhotoData* data) {
-    if (!lbl_photo_caption) return;
-    if (!data || !data->valid || !data->caption[0]) {
-        lv_label_set_text(lbl_photo_caption,
-            photo_have_image ? " " : "Waiting for photo...");
-        return;
-    }
-    lv_label_set_text(lbl_photo_caption, data->caption);
 }
 
 static bool logo_attention_on = false;
@@ -1700,27 +1346,6 @@ bool ui_afk_suppressed(void) {
     return (millis() - afk_dismissed_ms) < AFK_SUPPRESS_MS;
 }
 
-void ui_update_photo_image(const uint8_t* rgb565) {
-    if (!photo_canvas || !rgb565) return;
-    // Canvas buffer already points at the BLE photo PSRAM region, so the
-    // pixels are in place — we just invalidate to redraw.
-    photo_have_image = true;
-    lv_obj_clear_flag(photo_canvas, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_invalidate(photo_canvas);
-}
-
-// Toggle the photo caption only — leave the canvas visible so the user sees
-// the previous (intact) image while a new one is mid-transfer. Tearing is
-// limited to small strip overlap and is mostly invisible at 60 fps; hiding
-// the canvas turned out to leave the user staring at black for the whole
-// transfer window.
-void ui_set_photo_loading(bool loading) {
-    if (!lbl_photo_caption) return;
-    if (loading) {
-        lv_label_set_text(lbl_photo_caption, "Loading...");
-    }
-}
-
 void ui_update_calendar(const CalendarData* data) {
     if (!data || !data->valid || !data->title[0]) {
         lv_label_set_text(lbl_calendar_state, "CALENDAR");
@@ -1766,13 +1391,6 @@ void ui_tick_anim(void) {
             spotify_dance_frame = (spotify_dance_frame + 1) % a->frame_count;
             render_spotify_dance_frame(a, spotify_dance_frame);
         }
-    } else if (current_screen == SCREEN_POMODORO) {
-        // Cheap refresh — 4 Hz keeps the seconds digit snappy without thrash.
-        static uint32_t last_pomo_refresh = 0;
-        if (now - last_pomo_refresh >= 250) {
-            last_pomo_refresh = now;
-            ui_refresh_pomodoro();
-        }
     }
 
     // AFK animation runs whenever the overlay is showing, on top of whatever
@@ -1799,17 +1417,10 @@ static void apply_battery_visibility(void) {
     else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
 }
 
-// LVGL handles click debouncing internally. Screen-level handler fires when
-// no child consumed the event (children only consume if they have their own
-// event callback, e.g. the Reset Bluetooth zone). On BT screen we skip the
-// splash toggle so only the reset zone is interactive there.
+// Splash-as-screensaver: attached only to the Usage page and the splash root,
+// so a tap on Usage drops into the splash and a tap on the splash leaves it.
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    screen_t s = ui_get_current_screen();
-    // Splash-as-screensaver: only the Usage screen taps in, and only the
-    // active splash taps out. Spotify / Calendar / Settings / Bluetooth all
-    // have interactive widgets and shouldn't be hijacked by a stray tap.
-    if (s != SCREEN_USAGE && s != SCREEN_SPLASH) return;
     ui_toggle_splash();
 }
 
@@ -1819,31 +1430,15 @@ static void ble_reset_click_cb(lv_event_t* e) {
 }
 
 void ui_show_screen(screen_t screen) {
-    lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
-    if (history_container) lv_obj_add_flag(history_container, LV_OBJ_FLAG_HIDDEN);
-    if (vacation_container) lv_obj_add_flag(vacation_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(spotify_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(calendar_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(pomodoro_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(photo_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(btacc_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(settings_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
-    splash_hide();
-
-    switch (screen) {
-    case SCREEN_SPLASH:     splash_show(); break;
-    case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_HISTORY:    if (history_container) { lv_obj_clear_flag(history_container, LV_OBJ_FLAG_HIDDEN); render_history_graph(); } break;
-    case SCREEN_VACATION:   if (vacation_container) lv_obj_clear_flag(vacation_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_SPOTIFY:    lv_obj_clear_flag(spotify_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_CALENDAR:   lv_obj_clear_flag(calendar_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_POMODORO:   lv_obj_clear_flag(pomodoro_container, LV_OBJ_FLAG_HIDDEN); ui_refresh_pomodoro(); break;
-    case SCREEN_PHOTO:      lv_obj_clear_flag(photo_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_BTACC:      lv_obj_clear_flag(btacc_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_SETTINGS:   lv_obj_clear_flag(settings_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_BLUETOOTH:  lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_HIDDEN); break;
-    default: break;
+    for (int i = 0; i < SCREEN_COUNT; i++) {
+        if (screen_root[i]) lv_obj_add_flag(screen_root[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (screen == SCREEN_SPLASH) {
+        splash_show();
+    } else {
+        splash_hide();
+        if (screen_root[screen]) lv_obj_clear_flag(screen_root[screen], LV_OBJ_FLAG_HIDDEN);
+        if (screen == SCREEN_HISTORY) render_history_graph();
     }
 
     // Hide the logo overlay on the splash screen so the animation has a clean canvas
@@ -1857,42 +1452,24 @@ void ui_show_screen(screen_t screen) {
     apply_battery_visibility();
 }
 
-void ui_cycle_screen(void) {
-    // Bluetooth is intentionally outside the cycle — reachable only from
-    // the Settings screen entry. Cycling stays on screens with real-time
-    // content.
-    screen_t next;
-    switch (current_screen) {
-    case SCREEN_USAGE:     next = SCREEN_HISTORY;   break;
-    case SCREEN_HISTORY:   next = SCREEN_VACATION;  break;
-    case SCREEN_VACATION:  next = SCREEN_SPOTIFY;   break;
-    case SCREEN_SPOTIFY:   next = SCREEN_CALENDAR;  break;
-    case SCREEN_CALENDAR:  next = SCREEN_POMODORO;  break;
-    case SCREEN_POMODORO:  next = SCREEN_PHOTO;     break;
-    case SCREEN_PHOTO:     next = SCREEN_BTACC;     break;
-    case SCREEN_BTACC:     next = SCREEN_SETTINGS;  break;
-    case SCREEN_SETTINGS:  next = SCREEN_USAGE;     break;
-    case SCREEN_BLUETOOTH: next = SCREEN_SETTINGS;  break;
-    default:               next = SCREEN_USAGE;     break;
-    }
-    ui_show_screen(next);
+// Pages with nothing to show drop out of the cycle (Vacation without a trip),
+// and the auto-rotate timer also skips the config pages.
+static bool page_in_cycle(screen_t s, bool content_only) {
+    if (s == SCREEN_VACATION && !vac_active) return false;
+    if (content_only && (s == SCREEN_SETTINGS || s == SCREEN_BLUETOOTH)) return false;
+    return true;
 }
 
-void ui_cycle_screen_auto(void) {
-    // Auto-rotate stays on content screens only — Settings is config-only.
-    screen_t next;
-    switch (current_screen) {
-    case SCREEN_USAGE:     next = SCREEN_HISTORY; break;
-    case SCREEN_HISTORY:   next = SCREEN_VACATION; break;
-    case SCREEN_VACATION:  next = SCREEN_SPOTIFY; break;
-    case SCREEN_SPOTIFY:   next = SCREEN_CALENDAR; break;
-    case SCREEN_CALENDAR:  next = SCREEN_POMODORO; break;
-    case SCREEN_POMODORO:  next = SCREEN_PHOTO;    break;
-    case SCREEN_PHOTO:     next = SCREEN_BTACC;    break;
-    case SCREEN_BTACC:     next = SCREEN_USAGE;    break;
-    default:               next = SCREEN_USAGE;    break;
+void ui_step_screen(int dir, bool content_only) {
+    int pos = 0;  // splash / unknown: treat as sitting on Usage
+    for (size_t i = 0; i < PAGE_COUNT; i++) {
+        if (PAGE_ORDER[i] == current_screen) { pos = (int)i; break; }
     }
-    ui_show_screen(next);
+    for (size_t n = 0; n < PAGE_COUNT; n++) {
+        pos = (pos + (dir < 0 ? (int)PAGE_COUNT - 1 : 1)) % (int)PAGE_COUNT;
+        if (page_in_cycle(PAGE_ORDER[pos], content_only)) break;
+    }
+    ui_show_screen(PAGE_ORDER[pos]);
 }
 
 void ui_toggle_splash(void) {

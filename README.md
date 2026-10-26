@@ -12,9 +12,10 @@ A little ESP32 desk companion for Claude Code. It runs on a
 [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786)
 (480×480 AMOLED) and pairs with your Mac or Linux box over Bluetooth. A host
 daemon reads your Claude usage and a few other bits of desk-side context and
-streams them to the display; the device shows them across a set of cycling
-screens. The two side buttons double as a BLE keyboard for Claude Code's
-voice-mode and mode-toggle shortcuts.
+streams them to the display; the device shows them across a set of
+screens you flip through with the side buttons. Holding a side button turns
+it into a BLE keyboard key for Claude Code's voice-mode and mode-toggle
+shortcuts.
 
 The splash screen plays pixel-art Clawd animations that get busier as your
 usage rate climbs — sourced from [claudepix](https://claudepix.vercel.app),
@@ -26,24 +27,21 @@ usage rate climbs — sourced from [claudepix](https://claudepix.vercel.app),
 
 ## What's included
 
-**On the device** — a stack of screens you cycle with the middle button
-(and auto-rotate through when idle):
+**On the device** — a set of pages you flip through with the left/right
+buttons (and optionally auto-rotate through):
 
-- **Splash** — pixel-art Clawd; the animation mood tracks your usage rate.
+- **Splash** — pixel-art Clawd; the animation mood tracks your usage rate. Tap the Usage page to open it, tap again to leave.
 - **Usage** — 5-hour session and 7-day weekly rate-limit utilization, with reset countdowns.
 - **History** — a smooth 30-day graph of daily token usage, with today's total, the day-over-day delta, and the equivalent API cost (`~$X today` / `$X / 30D`, the ccusage number).
-- **Vacation** — a Polarsteps-style trip countdown: a full-bleed destination photo (pulled from Unsplash) behind a big "days until" number, the destination, and the date.
-- **Spotify** — now-playing track + album art, with the side buttons wired to play/pause and skip.
+- **Vacation** — a Polarsteps-style trip countdown: a full-bleed destination photo (pulled from Unsplash) behind a big "nights until" number and the destination. Only in the page cycle while a trip is set (up to 14 days after departure).
+- **Spotify** — now-playing track + album art; tap the page to play/pause.
 - **Calendar** — your next event and time until it starts.
-- **Pomodoro** — a tap-to-start focus timer.
-- **Photo** — rotating ambient scenic backgrounds.
-- **Bluetooth accessories** — battery levels of your other paired BT gear.
-- **Settings / Bluetooth** — auto-rotate toggle, connection status, bond reset.
+- **Settings / Bluetooth** — auto-rotate toggle + interval (tap to change), connection status, bond reset.
 
 **On the host** — a companion daemon (+ optional menu-bar app) that polls
 your Claude usage, aggregates daily token history and cost from your local
 `~/.claude` transcripts, and gathers the extras above (Spotify, calendar,
-photos, vacation image), pushing everything to the device over BLE.
+vacation image), pushing everything to the device over BLE.
 
 > Not every screen needs the host — usage/history/vacation come from the
 > daemon; Spotify/calendar are macOS-only extras. It's a personal build, so
@@ -178,20 +176,21 @@ photos tagged people/animals, prefers landscapes/cityscapes, and streams a
 1. The daemon reads your Claude Code OAuth token (Keychain / credentials file).
 2. It makes a minimal `api.anthropic.com/v1/messages` call — one Haiku token, basically free — and reads the usage numbers straight out of the `anthropic-ratelimit-unified-*` response headers.
 3. For the History screen it aggregates daily tokens + equivalent cost from your local `~/.claude/projects/**/*.jsonl` transcripts (deduped by message id, priced per model).
-4. It connects to the ESP32 over BLE and writes JSON payloads to the GATT RX characteristic; larger assets (album art, ambient photos, the vacation backdrop) stream over their own chunked characteristics.
+4. It connects to the ESP32 over BLE and writes JSON payloads to the GATT RX characteristic; larger assets (album art, the vacation backdrop) stream over their own chunked characteristics.
 5. The firmware parses everything and updates the LVGL screens; the splash animation mood follows the usage rate of change.
-6. The two side buttons are independent — they send Space and Shift+Tab as BLE HID keyboard reports to the paired host.
+6. Held side buttons send Space and Shift+Tab as BLE HID keyboard reports to the paired host.
 
 ## Physical buttons
 
-| Button           | GPIO         | Function                                                          |
-| ---------------- | ------------ | ----------------------------------------------------------------- |
-| **Left**         | GPIO 0       | Hold to send Space (Claude Code voice-mode push-to-talk)          |
-| **Middle** (PWR) | AXP2101 PKEY | Cycle screens; on splash, cycle animations                        |
-| **Right**        | GPIO 18      | Send Shift+Tab (Claude Code mode toggle)                          |
+| Button           | GPIO         | Tap                                   | Hold (≥ 0.4 s)                                         |
+| ---------------- | ------------ | ------------------------------------- | ------------------------------------------------------ |
+| **Left**         | GPIO 0       | Previous page (on splash: previous animation) | Space, held until release (Claude Code voice push-to-talk) |
+| **Middle** (PWR) | AXP2101 PKEY | Jump to the Usage page                | —                                                      |
+| **Right**        | GPIO 18      | Next page (on splash: next animation) | Shift+Tab (Claude Code mode toggle)                    |
 
 Space and Shift+Tab go out as standard BLE HID reports, so they land in
-whatever window has focus on the paired host.
+whatever window has focus on the paired host. While the AFK overlay is up,
+the first press of any button just dismisses it.
 
 ## BLE protocol
 
@@ -206,7 +205,6 @@ keyboard service:
 | REQ (device refresh request) | `4c41555a-4465-7669-6365-000000000004` |
 | IMG (album art chunks)       | `4c41555a-4465-7669-6365-000000000005` |
 | CMD (device→host commands)   | `4c41555a-4465-7669-6365-000000000006` |
-| PHOTO (ambient photo chunks) | `4c41555a-4465-7669-6365-000000000007` |
 | VACIMG (vacation backdrop)   | `4c41555a-4465-7669-6365-000000000008` |
 | **HID Service**              | `00001812-0000-1000-8000-00805f9b34fb` |
 
@@ -224,12 +222,11 @@ changed. Common keys:
 | `vac` `{dst,dl,d,a}` | Vacation (destination, date label, days, active) |
 | `spt`,`spa`,`spp`,`spc` | Spotify (track, artist, playing, colour) |
 | `cat`,`cam` | Calendar (title, minutes until) |
-| `pht` | Photo caption |
-| `bta` | Bluetooth accessory list |
 | `afk`,`attn` | AFK dim / attention bounce |
 
-Big assets (`IMG`, `PHOTO`, `VACIMG`) use a chunked `[hash][offset][total]`
-header so half-megabyte RGB565 frames fit.
+Big assets (`IMG`, `VACIMG`) use a chunked `[hash][offset][total]`
+header so half-megabyte RGB565 frames fit. CMD carries one-byte device→host
+commands (`0x01` = Spotify play/pause, sent when the Spotify page is tapped).
 
 ## Recompiling fonts
 
@@ -247,11 +244,16 @@ lv_font_conv --font assets/TiemposText-400-Regular.otf -r 0x20-0x7E \
   --size 56 --format lvgl --bpp 4 --no-compress \
   -o firmware/src/font_tiempos_56.c --lv-include "lvgl.h"
 
-# Styrene B (large numbers 48, panel labels 28, small text 24, minimal 20)
+# Styrene B (large numbers 48, panel labels 28, small text 24, minimal 20).
+# Latin-1 + Latin Extended-A + dashes/quotes/€ so track names, artists and
+# calendar titles with accents (é, à, ø, ł…) render instead of boxes.
 for size in 48 28 24 20; do
-  lv_font_conv --font assets/StyreneB-Regular.otf -r 0x20-0x7E \
+  lv_font_conv --font assets/StyreneB-Regular.otf \
+    -r 0x20-0x7E,0xA0-0xFF,0x100-0x17F,0x2013-0x2014,0x2018-0x2019,0x201C-0x201D,0x2022,0x2026,0x20AC \
     --size $size --format lvgl --bpp 4 --no-compress \
-    -o firmware/src/font_styrene_${size}.c --lv-include "lvgl.h"
+    -o /tmp/font_styrene_${size}.c --lv-include "lvgl.h"
+  python3 tools/patch_font_lvgl9.py /tmp/font_styrene_${size}.c \
+    firmware/src/font_styrene_${size}.c firmware/src/font_styrene_${size}.c
 done
 
 # DejaVu Sans Mono (32px, with spinner Unicode chars)
@@ -261,7 +263,7 @@ lv_font_conv --font assets/DejaVuSansMono.ttf \
   -o firmware/src/font_mono_32.c --lv-include "lvgl.h"
 ```
 
-**Important:** `lv_font_conv` v1.5.3 outputs LVGL 8 format. Each generated file must be patched for LVGL 9:
+**Important:** `lv_font_conv` v1.5.3 outputs LVGL 8 format. Each generated file must be patched for LVGL 9 — `tools/patch_font_lvgl9.py NEW.c OLD.c OUT.c` does this, and also keeps OLD's `line_height`/`base_line` so the extra glyph ranges (accented capitals are taller) don't shift every label. By hand:
 
 1. Remove `#if LVGL_VERSION_MAJOR >= 8` guards around `font_dsc` and the font struct
 2. Remove the `.cache` field from `font_dsc`

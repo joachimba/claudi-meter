@@ -9,16 +9,18 @@
 #include "imu.h"
 #include "splash.h"
 #include "settings.h"
-#include "pomodoro.h"
 #include "oled_protect.h"
 #include "usage_rate.h"
 
 // Physical buttons (global, screen-independent):
-//   BTN_BACK   (GPIO 0)  — left,  send Space (Claude Code voice mode push-to-talk)
-//   BTN_FWD    (GPIO 18) — right, send Shift+Tab (Claude Code mode toggle)
-//   AXP PWR    (PMU)     — middle, cycle screens; on splash, cycle animations
-#define BTN_BACK 0
-#define BTN_FWD  18
+//   BTN_LEFT  (GPIO 0)  — tap: previous page; hold: Space (Claude Code voice push-to-talk)
+//   BTN_RIGHT (GPIO 18) — tap: next page;     hold: Shift+Tab (Claude Code mode toggle)
+//   AXP PWR   (PMU)     — middle, jump to the Usage page
+// On the splash, left/right taps switch animation instead of page.
+#define BTN_LEFT  0
+#define BTN_RIGHT 18
+#define BTN_HOLD_MS     400  // held this long = keyboard key instead of a page tap
+#define BTN_DEBOUNCE_MS 30
 
 // ---- Hardware objects ----
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
@@ -33,8 +35,6 @@ SensorQMI8658 imu;
 static UsageData usage = {};
 static SpotifyData spotify = {};
 static CalendarData calendar = {};
-static PhotoData photo = {};
-static BTAccessoriesData bt_acc = {};
 static HistoryData history = {};
 static VacationData vacation = {};
 
@@ -163,12 +163,11 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 }
 
-// Parse a JSON line into UsageData / SpotifyData / CalendarData.
-// Daemon sends one merged payload; missing sections leave their valid flag
-// unchanged so a partial update doesn't blank existing UI state.
+// Parse one JSON payload from the daemon into the per-page data structs.
+// Payloads are partial; missing sections leave their valid flag unchanged so
+// an update for one page doesn't blank the others.
 static bool parse_json(const char* json, UsageData* u, SpotifyData* sp,
-                       CalendarData* cal, PhotoData* pho, BTAccessoriesData* bta,
-                       HistoryData* hist, VacationData* vac) {
+                       CalendarData* cal, HistoryData* hist, VacationData* vac) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
@@ -206,31 +205,12 @@ static bool parse_json(const char* json, UsageData* u, SpotifyData* sp,
         cal->valid = true;
     }
 
-    if (doc["pht"].is<const char*>()) {
-        strlcpy(pho->caption, doc["pht"] | "", sizeof(pho->caption));
-        pho->valid = true;
-    }
-
     if (doc["afk"].is<bool>()) {
         ui_set_afk(doc["afk"].as<bool>());
     }
 
     if (doc["attn"].is<bool>()) {
         ui_set_attention(doc["attn"].as<bool>());
-    }
-
-    if (doc["bta"].is<JsonArrayConst>()) {
-        JsonArrayConst arr = doc["bta"].as<JsonArrayConst>();
-        bta->count = 0;
-        for (JsonVariantConst v : arr) {
-            if (bta->count >= BT_ACC_MAX) break;
-            BTAccessory& dst = bta->items[bta->count];
-            strlcpy(dst.name, v["n"] | "", sizeof(dst.name));
-            dst.battery_pct = v["b"] | -1;
-            dst.charging    = v["c"] | false;
-            bta->count++;
-        }
-        bta->valid = true;
     }
 
     if (doc["tk"].is<JsonArrayConst>()) {
@@ -307,6 +287,13 @@ static void check_serial_cmd() {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) {
                 send_screenshot();
+            } else if (strncmp(cmd_buf, "screen ", 7) == 0) {
+                // QA helper: jump straight to a screen by enum index.
+                int s = atoi(cmd_buf + 7);
+                if (s >= 0 && s < SCREEN_COUNT) ui_show_screen((screen_t)s);
+            } else if (strcmp(cmd_buf, "next") == 0 || strcmp(cmd_buf, "prev") == 0) {
+                // QA helper: same page step as a side-button tap.
+                ui_step_screen(cmd_buf[0] == 'n' ? +1 : -1, false);
             }
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
@@ -372,15 +359,14 @@ void setup() {
 
     // Init settings (NVS-backed) before UI so initial widget state matches
     settings_init();
-    pomodoro_init();
     oled_protect_init();
 
     // Init BLE data channel
     ble_init();
 
-    // Physical buttons: back (GPIO 0) and forward (GPIO 18)
-    pinMode(BTN_BACK, INPUT_PULLUP);
-    pinMode(BTN_FWD,  INPUT_PULLUP);
+    // Physical side buttons (active low)
+    pinMode(BTN_LEFT,  INPUT_PULLUP);
+    pinMode(BTN_RIGHT, INPUT_PULLUP);
 
     // Build dashboard
     ui_init();
@@ -397,6 +383,59 @@ void setup() {
 }
 
 static ble_state_t last_ble_state = BLE_STATE_INIT;
+
+// Side button: tap = page step, hold = Claude Code key (sent once the hold
+// threshold passes, released with the button so push-to-talk works).
+struct SideButton {
+    uint8_t  pin;
+    int      dir;        // page step on tap
+    uint8_t  key, mods;  // HID key on hold
+    bool     down;
+    bool     key_sent;
+    uint32_t down_ms;
+    uint32_t changed_ms;
+};
+
+static SideButton side_buttons[] = {
+    {BTN_LEFT,  -1, 0x2C, 0x00},  // Space
+    {BTN_RIGHT, +1, 0x2B, 0x02},  // Tab + LEFT_SHIFT
+};
+
+static void handle_buttons(void) {
+    uint32_t now = millis();
+    for (SideButton& b : side_buttons) {
+        bool pressed = (digitalRead(b.pin) == LOW);
+        if (pressed != b.down && now - b.changed_ms >= BTN_DEBOUNCE_MS) {
+            b.down = pressed;
+            b.changed_ms = now;
+            oled_protect_note_activity();
+            if (pressed) {
+                b.down_ms = now;
+                b.key_sent = false;
+            } else if (b.key_sent) {
+                ble_keyboard_release();
+            } else if (ui_afk_active()) {
+                // First press while AFK only dismisses the overlay.
+                ui_afk_dismiss();
+            } else if (ui_get_current_screen() == SCREEN_SPLASH) {
+                splash_step(b.dir);
+            } else {
+                ui_step_screen(b.dir, false);
+            }
+        }
+        if (b.down && !b.key_sent && !ui_afk_active() && now - b.down_ms >= BTN_HOLD_MS) {
+            ble_keyboard_press(b.key, b.mods);
+            b.key_sent = true;
+        }
+    }
+
+    if (power_pwr_pressed()) {
+        oled_protect_note_activity();
+        if (ui_afk_active()) ui_afk_dismiss();
+        else                 ui_show_screen(SCREEN_USAGE);
+    }
+    if (touch_pressed) oled_protect_note_activity();
+}
 
 // Brightness ramp state for rotation transition
 // On rotation change we blank the panel, force a full LVGL redraw at the
@@ -435,74 +474,26 @@ void loop() {
     power_tick();
     imu_tick();
     splash_tick();
-    pomodoro_tick();
     oled_protect_tick();
 
-    // Three-button input (global, screen-independent):
-    //   LEFT  (GPIO 0)  → Space (voice-mode push-to-talk; press & release tracked)
-    //   RIGHT (GPIO 18) → Shift+Tab (Claude Code mode toggle)
-    //   PWR   (AXP)     → cycle screens; on splash, cycle animations
-    {
-        static bool back_was = false, fwd_was = false;
-        bool back_now = (digitalRead(BTN_BACK) == LOW);
-        bool fwd_now  = (digitalRead(BTN_FWD)  == LOW);
+    handle_buttons();
 
-        // While the AFK overlay is up the first press only dismisses it — the
-        // user is obviously here, and swallowing the press keeps a stray Space
-        // out of whatever has focus on the host.
-        if (back_now != back_was) {
-            back_was = back_now;
-            oled_protect_note_activity();
-            if (back_now) {
-                if (ui_afk_active()) ui_afk_dismiss();
-                else                 ble_keyboard_press(0x2C, 0);  // HID Space, no mods
-            } else {
-                ble_keyboard_release();
-            }
-        }
-        if (fwd_now != fwd_was) {
-            fwd_was = fwd_now;
-            oled_protect_note_activity();
-            if (fwd_now) {
-                if (ui_afk_active()) ui_afk_dismiss();
-                else                 ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
-            } else {
-                ble_keyboard_release();
-            }
-        }
-
-        if (power_pwr_pressed()) {
-            oled_protect_note_activity();
-            if (ui_afk_active()) {
-                ui_afk_dismiss();
-            } else if (ui_get_current_screen() == SCREEN_SPLASH) {
-                splash_next();
-            } else {
-                ui_cycle_screen();
-            }
-        }
-        if (touch_pressed) oled_protect_note_activity();
-    }
-
-    // Auto-rotate screens (skips Bluetooth + Splash). When the user enables
-    // this in Settings the dashboard cycles Usage → Spotify → Calendar →
-    // Settings → Usage at the configured interval.
+    // Auto-rotate (Settings toggle): step through the content pages on a timer.
+    // Paused on the splash and the config pages, and restarted on any page
+    // change so a manual tap gets the full interval.
     {
         static uint32_t last_rotate_ms = 0;
-        if (settings_auto_rotate()) {
-            uint32_t now = millis();
-            uint32_t interval = (uint32_t)settings_rotate_interval_sec() * 1000UL;
-            if (last_rotate_ms == 0) last_rotate_ms = now;
-            screen_t cs = ui_get_current_screen();
-            if (cs != SCREEN_SPLASH && cs != SCREEN_BLUETOOTH &&
-                cs != SCREEN_SETTINGS &&
-                now - last_rotate_ms >= interval) {
-                ui_cycle_screen_auto();
-                last_rotate_ms = now;
-            }
-        } else {
-            last_rotate_ms = 0;
+        static screen_t last_cs = SCREEN_SPLASH;
+        screen_t cs = ui_get_current_screen();
+        uint32_t now = millis();
+        if (!settings_auto_rotate() || cs != last_cs || cs == SCREEN_SPLASH ||
+                cs == SCREEN_SETTINGS || cs == SCREEN_BLUETOOTH) {
+            last_rotate_ms = now;
+        } else if (now - last_rotate_ms >= settings_rotate_interval_sec() * 1000UL) {
+            ui_step_screen(+1, true);
+            last_rotate_ms = now;
         }
+        last_cs = ui_get_current_screen();
     }
 
     handle_rotation_change();
@@ -546,7 +537,7 @@ void loop() {
     // Process incoming BLE data
     if (ble_has_data()) {
         oled_protect_note_activity();
-        if (parse_json(ble_get_data(), &usage, &spotify, &calendar, &photo, &bt_acc, &history, &vacation)) {
+        if (parse_json(ble_get_data(), &usage, &spotify, &calendar, &history, &vacation)) {
             int g_before = usage_rate_group();
             usage_rate_sample(usage.session_pct);
             int g_after = usage_rate_group();
@@ -563,8 +554,6 @@ void loop() {
             ui_update(&usage);
             ui_update_spotify(&spotify);
             ui_update_calendar(&calendar);
-            ui_update_photo_caption(&photo);
-            ui_update_bt_accessories(&bt_acc);
             ui_update_history(&history);
             ui_update_vacation(&vacation);
             ble_send_ack();
@@ -579,28 +568,10 @@ void loop() {
         ble_image_consume();
     }
 
-    // Ambient photo (full screen) reassembled on its own GATT char.
-    if (ble_photo_ready()) {
-        ui_update_photo_image(ble_photo_data());
-        ble_photo_consume();
-    }
-
     // Vacation backdrop reassembled on its own GATT char.
     if (ble_vacimg_ready()) {
         ui_update_vacation_image(ble_vacimg_data());
         ble_vacimg_consume();
-    }
-
-    // Hide the canvas while a new photo is mid-transfer so the user doesn't
-    // see half-old / half-new pixels rendered together.
-    {
-        static bool last_xfer = false;
-        bool xfer = ble_photo_transferring();
-        if (xfer != last_xfer) {
-            last_xfer = xfer;
-            extern void ui_set_photo_loading(bool);
-            ui_set_photo_loading(xfer);
-        }
     }
 
     delay(5);

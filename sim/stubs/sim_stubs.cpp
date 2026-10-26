@@ -27,10 +27,10 @@ bool ble_image_ready(void) { return false; }
 const uint8_t* ble_image_data(void) { return sim_img_buf; }
 void ble_image_consume(void) {}
 
-static uint8_t sim_photo_buf[BLE_PHOTO_W * BLE_PHOTO_H * 2] = {0};
-bool ble_photo_ready(void) { return false; }
-const uint8_t* ble_photo_data(void) { return sim_photo_buf; }
-void ble_photo_consume(void) {}
+static uint8_t sim_vacimg_buf[BLE_VACIMG_W * BLE_VACIMG_H * 2] = {0};
+bool ble_vacimg_ready(void) { return false; }
+const uint8_t* ble_vacimg_data(void) { return sim_vacimg_buf; }
+void ble_vacimg_consume(void) {}
 void ble_keyboard_press(uint8_t, uint8_t) {}
 void ble_keyboard_release(void) {}
 

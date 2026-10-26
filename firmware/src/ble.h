@@ -29,21 +29,14 @@ bool ble_image_ready(void);
 const uint8_t* ble_image_data(void);   // RGB565, BLE_ART_W*BLE_ART_H*2 bytes
 void ble_image_consume(void);          // clear the ready flag
 
-// Full-screen ambient photo (RGB565). Reassembled from chunks on a separate
-// PHOTO characteristic — same framing as IMG but with 32-bit offset/total so
-// half-megabyte payloads fit. ble_photo_ready() flips true on a fully-
-// received frame and clears on ble_photo_consume().
-#define BLE_PHOTO_W 480
-#define BLE_PHOTO_H 480
-bool ble_photo_ready(void);
-bool ble_photo_transferring(void);     // true while chunks are mid-flight
-const uint8_t* ble_photo_data(void);
-void ble_photo_consume(void);
-
-// Vacation backdrop (RGB565, 480x480) — same chunk framing as PHOTO on its
-// own characteristic + buffer, so the countdown screen keeps a stable image.
+// Full-screen vacation backdrop (RGB565). Reassembled from chunks on its own
+// characteristic — same framing as IMG but with 32-bit offset/total so the
+// half-megabyte frame fits. ble_vacimg_ready() flips true on a fully-received
+// frame and clears on ble_vacimg_consume().
+#define BLE_VACIMG_W 480
+#define BLE_VACIMG_H 480
 bool ble_vacimg_ready(void);
-const uint8_t* ble_vacimg_data(void);  // RGB565, BLE_PHOTO_W*BLE_PHOTO_H*2 bytes
+const uint8_t* ble_vacimg_data(void);  // RGB565, BLE_VACIMG_W*BLE_VACIMG_H*2 bytes
 void ble_vacimg_consume(void);
 
 // Device→daemon commands over CMD characteristic. Single-byte payload.

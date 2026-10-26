@@ -22,8 +22,9 @@ cmake --build build -j
 
 | Key       | Action                                         |
 | --------- | ---------------------------------------------- |
-| `1`..`5`  | Show Usage / Spotify / Calendar / Bluetooth / Splash |
-| `SPACE`   | Cycle screens (Usage → Spotify → Calendar → Bluetooth) |
+| `←` / `→` | Previous / next page (same as the device's side-button taps) |
+| `0`..`7`  | Jump to a screen by `screen_t` index (0 = Splash) |
+| `SPACE`   | Next page |
 | `a`       | Cycle gradient album-art placeholder           |
 | `p`       | Toggle Spotify play / paused                   |
 | `r`       | Re-randomize fake usage / calendar numbers     |
@@ -34,7 +35,7 @@ cmake --build build -j
 
 - Pixel-perfect UI render (same LVGL widgets, same fonts, same theme).
 - Touch input (mouse click).
-- Splash, Usage, Spotify, Calendar, Bluetooth screens.
+- Every page (Splash, Usage, History, Vacation, Spotify, Calendar, Settings, Bluetooth); History/Vacation show their empty state since the sim feeds no data for them.
 - Album art via synthetic gradient (real PNGs would need stb_image hooked in).
 
 ## What it doesn't cover

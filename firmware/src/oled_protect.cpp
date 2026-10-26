@@ -53,10 +53,6 @@ void oled_protect_note_activity(void) {
     }
 }
 
-bool oled_protect_is_dark(void) {
-    return s_current_brightness == BRIGHTNESS_OFF;
-}
-
 void oled_protect_tick(void) {
     uint32_t now = millis();
     uint32_t idle = now - s_last_activity_ms;

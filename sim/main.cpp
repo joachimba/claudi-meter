@@ -5,8 +5,9 @@
 // calendar data is injected at startup so every screen has content.
 //
 // Controls:
-//   1 .. 5     show Usage / Spotify / Calendar / Bluetooth / Splash
-//   SPACE      cycle screens (Usage -> Spotify -> Calendar -> Bluetooth)
+//   LEFT/RIGHT previous / next page (same as the device's side buttons)
+//   0 .. 7     jump to a screen by screen_t index (0 = splash)
+//   SPACE      next page
 //   a          load gradient placeholder into Spotify album art
 //   p          toggle Spotify play/paused state
 //   r          re-randomize usage % / calendar minutes
@@ -178,14 +179,12 @@ int main(int argc, char* argv[]) {
             case SDL_KEYDOWN:
                 switch (ev.key.keysym.sym) {
                 case SDLK_q: case SDLK_ESCAPE: running = false; break;
-                case SDLK_1: ui_show_screen(SCREEN_USAGE); break;
-                case SDLK_2: ui_show_screen(SCREEN_SPOTIFY); break;
-                case SDLK_3: ui_show_screen(SCREEN_CALENDAR); break;
-                case SDLK_4: ui_show_screen(SCREEN_BLUETOOTH); break;
-                case SDLK_5: ui_show_screen(SCREEN_SETTINGS); break;
-                case SDLK_6: ui_show_screen(SCREEN_BLUETOOTH); break;
-                case SDLK_0: ui_show_screen(SCREEN_SPLASH); break;
-                case SDLK_SPACE: ui_cycle_screen(); break;
+                case SDLK_0: case SDLK_1: case SDLK_2: case SDLK_3:
+                case SDLK_4: case SDLK_5: case SDLK_6: case SDLK_7:
+                    ui_show_screen((screen_t)(ev.key.keysym.sym - SDLK_0));
+                    break;
+                case SDLK_LEFT:  ui_step_screen(-1, false); break;
+                case SDLK_RIGHT: case SDLK_SPACE: ui_step_screen(+1, false); break;
                 case SDLK_a:
                     variant = (variant + 1) % 16;
                     fill_gradient_art(g_art_buf, BLE_ART_W, BLE_ART_H, variant);

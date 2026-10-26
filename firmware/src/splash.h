@@ -9,8 +9,8 @@ void splash_init(lv_obj_t *parent);
 // Advance animation frame if hold time elapsed. Call from main loop.
 void splash_tick(void);
 
-// Cycle to the next animation in the catalog.
-void splash_next(void);
+// Cycle to the next (dir > 0) or previous (dir < 0) animation in the catalog.
+void splash_step(int dir);
 
 // Show/hide the splash container.
 void splash_show(void);

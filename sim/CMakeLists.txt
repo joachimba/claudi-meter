@@ -47,19 +47,13 @@ add_executable(clawdmeter-sim
     ${FW_SRC}/ui.cpp
     ${FW_SRC}/splash.cpp
     ${FW_SRC}/settings.cpp
-    ${FW_SRC}/pomodoro.cpp
     ${FW_SRC}/oled_protect.cpp
     ${FW_SRC}/usage_rate.cpp
-    ${FW_SRC}/font_styrene_12.c
-    ${FW_SRC}/font_styrene_14.c
-    ${FW_SRC}/font_styrene_16.c
     ${FW_SRC}/font_styrene_20.c
     ${FW_SRC}/font_styrene_24.c
     ${FW_SRC}/font_styrene_28.c
     ${FW_SRC}/font_styrene_48.c
-    ${FW_SRC}/font_tiempos_34.c
     ${FW_SRC}/font_tiempos_56.c
-    ${FW_SRC}/font_mono_18.c
     ${FW_SRC}/font_mono_32.c
 )
 

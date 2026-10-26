@@ -26,11 +26,6 @@ struct CalendarData {
     bool valid;
 };
 
-struct PhotoData {
-    char caption[96];        // photographer / place text from daemon
-    bool valid;
-};
-
 #define HISTORY_MAX_DAYS 30
 struct HistoryData {
     // Daily token usage, oldest -> newest, in units of 100k tokens.
@@ -46,17 +41,5 @@ struct VacationData {
     char date_label[40];    // preformatted, e.g. "1 Sep 2026"
     int  days;              // days until trip start; 0 = today, <0 = under way
     bool active;            // false when no trip is configured
-    bool valid;
-};
-
-#define BT_ACC_MAX 6
-struct BTAccessory {
-    char name[40];
-    int  battery_pct;    // 0..100; -1 if unknown
-    bool charging;
-};
-struct BTAccessoriesData {
-    BTAccessory items[BT_ACC_MAX];
-    uint8_t count;
     bool valid;
 };

@@ -9,9 +9,6 @@ enum screen_t {
     SCREEN_VACATION,
     SCREEN_SPOTIFY,
     SCREEN_CALENDAR,
-    SCREEN_POMODORO,
-    SCREEN_PHOTO,
-    SCREEN_BTACC,
     SCREEN_SETTINGS,
     SCREEN_BLUETOOTH,
     SCREEN_COUNT,
@@ -22,9 +19,6 @@ void ui_update(const UsageData* data);
 void ui_update_spotify(const SpotifyData* data);
 void ui_update_spotify_art(const uint8_t* rgb565, int w, int h);
 void ui_update_calendar(const CalendarData* data);
-void ui_update_photo_caption(const PhotoData* data);
-void ui_update_photo_image(const uint8_t* rgb565);
-void ui_update_bt_accessories(const BTAccessoriesData* data);
 void ui_update_history(const HistoryData* data);
 void ui_update_vacation(const VacationData* data);
 void ui_update_vacation_image(const uint8_t* rgb565);
@@ -33,11 +27,11 @@ bool ui_afk_active(void);         // overlay currently covering the screen?
 void ui_afk_dismiss(void);        // local escape: hide it and mute the stale-data watchdog
 bool ui_afk_suppressed(void);     // true while a manual dismiss is still holding it off
 void ui_set_attention(bool on);   // bounce the top-left Clawd logo when Claude Code needs you
-void ui_refresh_settings(void);   // sync Settings screen widgets to settings.cpp state
 void ui_tick_anim(void);
 void ui_show_screen(screen_t screen);
-void ui_cycle_screen(void);
-void ui_cycle_screen_auto(void);   // auto-rotate cycle: Usage→Spotify→Calendar (skips Settings/BT)
+// Step through the page cycle (dir +1 = next, -1 = previous). `content_only`
+// skips Settings / Bluetooth, for the auto-rotate timer.
+void ui_step_screen(int dir, bool content_only);
 void ui_toggle_splash(void);
 screen_t ui_get_current_screen(void);
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac);
